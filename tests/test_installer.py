@@ -221,6 +221,23 @@ show_result() { :; }
         prefix = 'import pathlib\nfiles=' + repr(files) + '\npathlib.Path.read_text=lambda self: files[str(self).replace("\\\\", "/")]\n'
         self.assertNotEqual(self.run_python("import_legacy", [target], prefix).returncode, 0)
 
+    def test_unrelated_existing_credentials_are_not_overwritten(self):
+        self.shell(r'''
+test_dir=$WORK_DIR
+mkdir -p "$test_dir/etc/ppp" "$test_dir/etc/xl2tpd"
+sed "s#/etc/#$test_dir/etc/#g" ./l2tp.sh > "$test_dir/installer-test.sh"
+source "$test_dir/installer-test.sh"
+WORK_DIR=$test_dir
+: > "$test_dir/etc/ipsec.conf"
+: > "$test_dir/etc/ipsec.secrets"
+: > "$test_dir/etc/xl2tpd/xl2tpd.conf"
+echo '# no accounts' > "$test_dir/etc/ppp/chap-secrets"
+detect_existing
+echo 'other-vpn * OtherPass123 *' > "$test_dir/etc/ppp/chap-secrets"
+if (detect_existing); then exit 1; fi
+grep -q other-vpn "$test_dir/etc/ppp/chap-secrets"
+''')
+
     def test_legacy_psk_is_rotated(self):
         self.shell(r'''
 CONFIG_FILE=$WORK_DIR/config

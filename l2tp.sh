@@ -212,7 +212,11 @@ preflight() {
 detect_existing() {
     local conns xlsections file
     conns=$(sed -nE 's/^[[:space:]]*conn[[:space:]]+([^[:space:]]+).*/\1/p' /etc/ipsec.conf 2>/dev/null || true)
-    xlsections=$(grep -E '^\[' /etc/xl2tpd/xl2tpd.conf 2>/dev/null || true)
+    xlsections=$(sed -nE 's/^[[:space:]]*(\[.*\])[[:space:]]*$/\1/p' /etc/xl2tpd/xl2tpd.conf 2>/dev/null || true)
+    if [[ -n $(grep -E '^[[:space:]]*include[[:space:]]' /etc/ipsec.conf 2>/dev/null | \
+        grep -Ev '^[[:space:]]*include[[:space:]]+/etc/ipsec.d/\*\.conf[[:space:]]*(#.*)?$' || true) ]]; then
+        die '检测到非标准 IPsec include 配置，未覆盖其他 VPN。'
+    fi
     for file in /etc/ipsec.d/*.conf; do
         [[ ! -f $file ]] || ! grep -qE '^[[:space:]]*conn[[:space:]]' "$file" || die "检测到其他 IPsec 配置：$file。"
     done
@@ -220,7 +224,14 @@ detect_existing() {
         [[ $conns == l2tp-ikuai && $xlsections == $'[global]\n[lns default]' ]] || die '现有配置已被外部修改，请先检查后再运行。'
         return
     fi
-    if [[ -z $conns && -z $xlsections ]]; then return; fi
+    if [[ -z $conns && -z $xlsections ]]; then
+        for file in /etc/ppp/chap-secrets /etc/ipsec.secrets; do
+            if grep -qE '^[[:space:]]*[^#[:space:]]' "$file" 2>/dev/null; then
+                die "检测到现有凭据：$file，无法判定用途，未覆盖。"
+            fi
+        done
+        return
+    fi
     [[ $conns == L2TP-PSK-NAT && $xlsections == $'[global]\n[lns default]' ]] || die '发现无法明确识别的 VPN 配置，未覆盖。'
     LEGACY=1
 }
