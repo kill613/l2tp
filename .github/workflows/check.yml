@@ -20,7 +20,7 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck libreswan xl2tpd ppp iptables
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck libreswan xl2tpd ppp iptables ufw
       - name: Syntax and ShellCheck
         run: |
           bash -n l2tp.sh tests/integration.sh

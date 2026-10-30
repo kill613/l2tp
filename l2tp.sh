@@ -76,7 +76,7 @@ random_secret() {
     # Read bounded blocks: no tr | head SIGPIPE under pipefail, no Bash $RANDOM.
     while :; do
         value=$(od -An -N256 -tu1 /dev/urandom | awk '
-            {for(i=1;i<=NF;i++) if($i<248) printf "%s", substr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",$i%62+1,1)}')
+            {for(i=1;i<=NF;i++) if($i<248) printf "%s", substr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",$i%62+1,1)}') || die '无法读取系统安全随机源。'
         value=${value:0:length}
         if [[ ${#value} == "$length" && $value == *[A-Z]* && $value == *[a-z]* && $value == *[0-9]* ]]; then
             printf '%s' "$value"
@@ -88,13 +88,15 @@ random_secret() {
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
 port_busy() {
     # Both TCP and UDP are avoided; include non-listening bound UDP sockets.
-    ss -H -anlut | awk -v port="$1" '$5 ~ (":" port "$") {found=1} END {exit !found}'
+    local sockets
+    sockets=$(ss -H -anlut) || die '无法读取端口占用信息。'
+    printf '%s\n' "$sockets" | awk -v port="$1" '$5 ~ (":" port "$") {found=1} END {exit !found}'
 }
 pick_port() {
     local low high n candidate
     read -r low high < "${1:-/proc/sys/net/ipv4/ip_local_port_range}"
     for ((n=0; n<1000; n++)); do
-        candidate=$(od -An -N4 -tu4 /dev/urandom)
+        candidate=$(od -An -N4 -tu4 /dev/urandom) || die '无法读取系统安全随机源。'
         candidate=$((10000 + candidate % 50001))
         (( candidate < low || candidate > high )) || continue
         [[ $candidate != "${OLD_PORT:-}" ]] || continue
@@ -285,13 +287,13 @@ EOF
 
 try_mirror() {
     local base=$1 security=$2 attempt
-    write_sources "$base" "$security"
+    write_sources "$base" "$security" || return 1
     for attempt in 1 2 3; do
         log "软件源：$base（第 $attempt/3 次）"
         # A private list directory prevents using stale indexes from another mirror.
-        rm -rf -- "$WORK_DIR/lists"
-        mkdir -p "$WORK_DIR/lists/partial"
-        chmod 755 "$WORK_DIR/lists" "$WORK_DIR/lists/partial"
+        rm -rf -- "$WORK_DIR/lists" || return 1
+        mkdir -p "$WORK_DIR/lists/partial" || return 1
+        chmod 755 "$WORK_DIR/lists" "$WORK_DIR/lists/partial" || return 1
         if timeout 300 apt-get "${APT_OPTS[@]}" update &&
             DEBIAN_FRONTEND=noninteractive timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-remove --no-install-recommends \
                 libreswan xl2tpd ppp iptables python3 curl ca-certificates; then

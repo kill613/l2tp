@@ -126,6 +126,10 @@ OLD_PORT=19000
             with self.subTest(assignment=assignment):
                 self.shell(assignment + "\nvalidate_values", ok=False)
 
+    def test_probe_failures_do_not_look_like_free_ports_or_secrets(self):
+        self.shell('od() { return 1; }; random_secret 18', ok=False)
+        self.shell('ss() { return 1; }; port_busy 18562', ok=False)
+
     def test_ipsec_configuration_by_version(self):
         self.shell(r'''
 dpkg-query() { echo "${test_version}"; }

@@ -3,8 +3,9 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 if [[ ${1:-} != --namespace ]]; then
-    exec unshare --net bash tests/integration.sh --namespace
+    exec unshare --net --mount bash tests/integration.sh --namespace
 fi
+mount --make-rprivate /
 # shellcheck source=l2tp.sh
 source ./l2tp.sh
 WORK_DIR=$(mktemp -d)
@@ -66,4 +67,22 @@ daemon_pid=$!
 sleep 2
 kill -0 "$daemon_pid" || { cat "$WORK_DIR/xl2tpd.log"; exit 1; }
 ss -H -luntp | grep ':18562 ' >/dev/null
-echo 'IPsec/xl2tpd configuration and isolated iptables/UFW checks passed.'
+
+# Exercise a real enabled UFW and reload without touching the runner's /etc/ufw.
+remove_owned_firewall
+cp -a /etc/ufw "$WORK_DIR/ufw"
+mount --bind "$WORK_DIR/ufw" /etc/ufw
+ip address add 198.18.0.1/24 dev ens3
+ip route add default via 198.18.0.254 dev ens3
+ufw allow 22/tcp
+ufw --force enable
+OLD_BACKEND=ufw
+apply_firewall
+[[ $FIREWALL_BACKEND == ufw ]]
+ufw reload
+iptables -C L2TP-IN -p udp --dport 18563 -m policy --dir in --pol ipsec -j ACCEPT
+iptables -C L2TP-IN -p udp --dport 18563 -j DROP
+iptables -C ufw-user-input -p tcp --dport 22 -j ACCEPT
+[[ $(iptables -S ufw-before-input | grep -c -- '-j L2TP-IN') == 1 ]]
+[[ $(iptables -S L2TP-IN | grep -c -- '^-A ') == 4 ]]
+echo 'IPsec/xl2tpd configuration and isolated iptables/active UFW checks passed.'
