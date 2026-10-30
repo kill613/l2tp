@@ -22,8 +22,9 @@ VPN_LOCAL_IP=192.168.18.1
 VPN_CIDR=192.168.18.0/24
 VPN_IP_RANGE=192.168.18.10-192.168.18.250
 EGRESS_IF=ens3
+configure_ipsec_version
 render_configs "$WORK_DIR/render"
-/usr/libexec/ipsec/addconn --config "$WORK_DIR/render/ipsec.conf" --checkconfig
+ipsec addconn --config "$WORK_DIR/render/ipsec.conf" --checkconfig
 
 ip link set lo up
 ip link add ens3 type dummy

@@ -153,7 +153,7 @@ ask_settings() {
     VPN_USER=${VPN_USER:-real}
     VPN_PASS=${VPN_PASS:-$(random_secret 18)}
     IPSEC_PSK=${IPSEC_PSK:-$(random_secret 32)}
-    L2TP_PORT=${L2TP_PORT:-$(pick_port)}
+    L2TP_PORT=${L2TP_PORT:-$(pick_port /proc/sys/net/ipv4/ip_local_port_range)}
     VPN_LOCAL_IP=${VPN_LOCAL_IP:-192.168.18.1}
     VPN_CIDR=${VPN_CIDR:-192.168.18.0/24}
     VPN_IP_RANGE=${VPN_IP_RANGE:-192.168.18.10-192.168.18.250}
@@ -414,6 +414,14 @@ backup_files() {
     CHANGED=1
 }
 
+configure_ipsec_version() {
+    local version
+    version=$(dpkg-query -W -f='${Version}' libreswan)
+    IKEV1_POLICY_LINE=''
+    # Jammy ships 3.32 (no global IKEv1 switch); Noble ships 4.14.
+    if dpkg --compare-versions "$version" ge 4.5; then IKEV1_POLICY_LINE='    ikev1-policy=accept'; fi
+}
+
 render_configs() {
     local dest=$1
     mkdir -p "$dest"
@@ -421,7 +429,7 @@ render_configs() {
 # Managed by l2tp-installer
 config setup
     uniqueids=no
-    ikev1-policy=accept
+${IKEV1_POLICY_LINE:-}
 conn l2tp-ikuai
     authby=secret
     ikev2=never
@@ -480,7 +488,7 @@ EOF
 
 install_configs() {
     local file
-    /usr/libexec/ipsec/addconn --config "$WORK_DIR/render/ipsec.conf" --checkconfig
+    ipsec addconn --config "$WORK_DIR/render/ipsec.conf" --checkconfig
     mkdir -p /etc/xl2tpd /etc/ppp /usr/local/libexec
     for file in ipsec.conf ipsec.secrets; do install -m 600 "$WORK_DIR/render/$file" "/etc/$file"; done
     install -m 600 "$WORK_DIR/render/xl2tpd.conf" /etc/xl2tpd/xl2tpd.conf
@@ -705,6 +713,7 @@ main() {
     chmod 711 "$WORK_DIR"
     STEP=优选软件源及安装依赖
     install_packages
+    configure_ipsec_version
     if (( LEGACY )); then
         import_legacy
         OLD_PORT=$L2TP_PORT

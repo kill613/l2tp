@@ -126,6 +126,20 @@ OLD_PORT=19000
             with self.subTest(assignment=assignment):
                 self.shell(assignment + "\nvalidate_values", ok=False)
 
+    def test_ipsec_configuration_by_version(self):
+        self.shell(r'''
+dpkg-query() { echo "${test_version}"; }
+dpkg() { [[ $2 != 3.* ]]; }
+test_version=3.32-3ubuntu3
+configure_ipsec_version
+render_configs "$WORK_DIR/old"
+if grep -q ikev1-policy "$WORK_DIR/old/ipsec.conf"; then exit 1; fi
+test_version=4.14-1ubuntu2
+configure_ipsec_version
+render_configs "$WORK_DIR/new"
+grep -q ikev1-policy=accept "$WORK_DIR/new/ipsec.conf"
+''')
+
     def test_secret_escaping_and_roundtrip(self):
         secret = 'Sp ace"quote\\back$()`tick#123'
         self.shell("VPN_PASS=" + shlex.quote(secret) + "\nIPSEC_PSK=$VPN_PASS\n" + r'''
@@ -164,6 +178,7 @@ preflight() { :; }
 detect_existing() { :; }
 detect_backend() { :; }
 install_packages() { :; }
+configure_ipsec_version() { :; }
 detect_egress() { :; }
 validate_network() { :; }
 port_busy() { return 1; }
@@ -209,6 +224,7 @@ NONINTERACTIVE=1
 preflight() { :; }
 detect_existing() { LEGACY=1; }
 install_packages() { :; }
+configure_ipsec_version() { :; }
 import_legacy() { IPSEC_PSK=OldPSK123; }
 detect_egress() { :; }
 validate_network() { :; }
@@ -231,6 +247,7 @@ NONINTERACTIVE=1
 preflight() { :; }
 detect_existing() { :; }
 install_packages() { :; }
+configure_ipsec_version() { :; }
 detect_egress() { :; }
 validate_network() { :; }
 port_busy() { return 1; }
