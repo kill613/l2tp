@@ -90,7 +90,7 @@ sudo env NONINTERACTIVE=1 bash l2tp.sh --reconfigure
 - 自动识别 IPv4 出口网卡，使用 MASQUERADE 转发客户端流量，适配 `ens3`、`enp1s0` 等网卡名及云主机私网地址。
 - 自动设置 IPv4 转发，配置 UDP 500/4500 与 ESP 协议（不是 TCP/UDP 50 端口）；随机 L2TP 端口只接收经 IPsec 保护的数据，拒绝裸 L2TP。
 - UFW 已启用时，在 `before.rules` 中维护带标记的专用规则，支持 UFW 重载；否则使用 iptables 专用链（包括 Debian 和 Ubuntu 的 iptables-nft 后端）。不清空其他规则、不启停 UFW、不改变 SSH 规则。
-- 启用 `ipsec`、`xl2tpd`、`l2tp-firewall` 开机启动；规则恢复先于 VPN 服务执行。服务退出异常时自动重启，重复运行不重复添加规则。
+- 启用 `ipsec`、`xl2tpd`、`l2tp-firewall` 开机启动；规则恢复先于 VPN 服务执行。如果 `xl2tpd` 软件包只提供 SysV 启动脚本，安装器会补充原生 systemd 服务。服务退出异常时自动重启，重复运行不重复添加规则。
 - 云安全组、运营商过滤与上游路由器无法由本机规则控制。使用 IPsec UDP 封装时，上游通常只需允许/映射 UDP 500/4500；随机 L2TP 端口在服务器解密后匹配，无需直接向公网开放裸 L2TP。仅修改本机防火墙不代表已修改云安全组。
 - 安装时对清华、中科大、阿里云镜像进行限时 InRelease 下载并验证对应发行版的签名，按耗时优选；实际更新或安装失败，每个候选最多尝试三次，再尝试下一镜像，最后回退官方源。
 - 分别处理 Debian `bookworm/trixie`、Ubuntu `jammy/noble` 及对应架构的软件源，使用临时 APT 源和独立索引，不永久改写系统软件源，不执行整机升级，不关闭签名校验。

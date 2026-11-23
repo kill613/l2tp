@@ -61,6 +61,8 @@ jobs:
             bash -n tests/integration.sh
             shellcheck -x l2tp.sh tests/integration.sh
             PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+            ensure_xl2tpd_unit
+            systemd-analyze verify xl2tpd.service ipsec.service
             systemctl --root=/ enable ipsec.service xl2tpd.service
             systemctl --root=/ is-enabled ipsec.service
             systemctl --root=/ is-enabled xl2tpd.service

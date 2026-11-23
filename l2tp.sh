@@ -31,8 +31,12 @@ cleanup() {
         log "失败步骤：$STEP（退出码 $rc）。未宣告安装成功。"
         if (( CHANGED && ! COMMITTED )) && [[ -n $BACKUP_DIR ]]; then
             log "正在恢复修改前的配置：$BACKUP_DIR"
+            if [[ -f /etc/systemd/system/xl2tpd.service && ! -e $BACKUP_DIR/files/etc/systemd/system/xl2tpd.service ]]; then
+                systemctl stop xl2tpd || true
+                systemctl disable xl2tpd || true
+            fi
             while IFS= read -r path; do
-                if [[ -e $BACKUP_DIR/files$path ]]; then
+                if [[ -e $BACKUP_DIR/files$path || -L $BACKUP_DIR/files$path ]]; then
                     cp -a -- "$BACKUP_DIR/files$path" "$path" || log "恢复失败：$path"
                 else
                     rm -f -- "$path"
@@ -431,9 +435,10 @@ backup_files() {
     for path in "$CONFIG_FILE" "$RUNTIME" /etc/ipsec.conf /etc/ipsec.secrets /etc/xl2tpd/xl2tpd.conf \
         /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets /etc/ufw/before.rules \
         /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
+        /etc/systemd/system/xl2tpd.service \
         /etc/systemd/system/ipsec.service.d/l2tp-installer.conf /etc/systemd/system/xl2tpd.service.d/l2tp-installer.conf; do
         printf '%s\n' "$path" >> "$BACKUP_DIR/manifest"
-        if [[ -e $path ]]; then
+        if [[ -e $path || -L $path ]]; then
             mkdir -p "$BACKUP_DIR/files$(dirname "$path")"
             cp -a -- "$path" "$BACKUP_DIR/files$path"
         fi
@@ -646,7 +651,30 @@ apply_firewall() {
     fi
 }
 
+ensure_xl2tpd_unit() {
+    local path
+    for path in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        if [[ -e $path/xl2tpd.service || -L $path/xl2tpd.service ]]; then return; fi
+    done
+    # Debian's xl2tpd package may provide only a SysV init script.
+    cat > /etc/systemd/system/xl2tpd.service <<'EOF'
+[Unit]
+Description=L2TP tunneling daemon
+After=network.target
+
+[Service]
+Type=simple
+RuntimeDirectory=xl2tpd
+ExecStart=/usr/sbin/xl2tpd -D
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 /etc/systemd/system/xl2tpd.service
+}
+
 install_services() {
+    ensure_xl2tpd_unit
     mkdir -p /etc/systemd/system/{ipsec,xl2tpd}.service.d
     cat > /etc/systemd/system/l2tp-firewall.service <<EOF
 [Unit]
