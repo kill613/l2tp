@@ -101,6 +101,8 @@ ip link add zero-server type veth peer name zero-client
 ip link set zero-client netns "$client_ns"
 ip address add 198.19.0.1/24 dev zero-server
 ip link set zero-server up
+# Keep the protocol test independent of the earlier synthetic INPUT DROP.
+iptables -I INPUT 1 -i zero-server -p udp --dport 500 -j ACCEPT
 ip netns exec "$client_ns" ip link set lo up
 ip netns exec "$client_ns" ip address add 198.19.0.2/24 dev zero-client
 ip netns exec "$client_ns" ip link set zero-client up
