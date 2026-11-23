@@ -331,7 +331,7 @@ timeout() {
 }
 sqv() {
     [[ $# == 6 && $1 == --keyring && $2 == "$ARCHIVE_KEYRING" &&
-       $3 == --cleartext && $4 == --output && $5 == - && $(cat "$6") == signed ]]
+       $3 == --cleartext && $4 == --output && $5 == "$WORK_DIR/probe.clear" && $(cat "$6") == signed ]]
 }
 probe_mirror https://example.invalid/debian
 sqv() { return 1; }

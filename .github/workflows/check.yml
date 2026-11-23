@@ -57,8 +57,7 @@ jobs:
             if [[ $CODENAME == trixie ]]; then
               command -v sqv
               probe_mirror http://deb.debian.org/debian || {
-                ls -l "$WORK_DIR/probe"
-                sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output - "$WORK_DIR/probe" >/dev/null
+                sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output "$WORK_DIR/probe.diagnostic" "$WORK_DIR/probe"
                 exit 1
               }
             fi

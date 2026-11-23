@@ -367,7 +367,7 @@ install_packages() {
             log "镜像暂不可用：$base；保留为后续重试候选。"
             printf '999999 %s\n' "$idx" >> "$WORK_DIR/ranking"
         fi
-        rm -f -- "$WORK_DIR/probe"
+        rm -f -- "$WORK_DIR/probe" "$WORK_DIR/probe.clear"
     done
     apt_options
     while read -r _elapsed idx; do
@@ -380,7 +380,7 @@ install_packages() {
 probe_mirror() {
     local -a verifier
     if command -v sqv >/dev/null; then
-        verifier=(sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output -)
+        verifier=(sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output "$WORK_DIR/probe.clear")
     elif command -v gpgv >/dev/null; then
         verifier=(gpgv --keyring "$ARCHIVE_KEYRING")
     else
