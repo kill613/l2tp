@@ -1,6 +1,6 @@
 # Ubuntu L2TP/IPsec 一键安装
 
-适用于 **Ubuntu 22.04 / 24.04，amd64 / arm64，systemd**，面向爱快路由器的 L2TP 客户端。通过 Ubuntu 软件包安装 Libreswan、xl2tpd、PPP，无需编译。
+适用于 **Ubuntu 22.04 / 24.04，amd64 / arm64，systemd**，面向爱快路由器的 L2TP 客户端。以秋水逸冰的 [L2TP/IPSec 一键安装脚本](https://teddysun.com/448.html) 为二次开发基础，保留作者署名和 Apache-2.0 许可证。沿用其编译安装、IPsec/PPP 配置和完成后输出连接信息的流程，适配当前 Ubuntu。xl2tpd、PPP 和编译依赖通过 Ubuntu 软件源安装；Libreswan 4.15 在独立目录编译。
 
 ## 安装
 
@@ -13,7 +13,7 @@ curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
   -o l2tp.sh && sudo bash l2tp.sh
 ```
 
-仓库默认分支为 `main`，旧说明中的 `master` 下载地址应改为 `main`。下载脚本前尚未运行优选逻辑，若服务器无法访问 GitHub，请先在其他设备下载 `l2tp.sh`，上传后执行。不使用不明 GitHub 代理执行代码。
+仓库默认分支为 `main`，旧说明中的 `master` 下载地址应改为 `main`。下载脚本前尚未运行优选逻辑，若服务器无法访问 GitHub，请先在其他设备下载 `l2tp.sh`，上传后执行。Libreswan 源码先尝试公开加速渠道，随后回退官方 GitHub，两个渠道均须通过固定 SHA-256 校验。
 
 首次安装会检测公网 IPv4，可回车采用或手动修改；可输入账户、密码、预共享密钥和 L2TP 端口，留空使用以下默认值：
 
@@ -72,7 +72,7 @@ sudo env NONINTERACTIVE=1 bash l2tp.sh --reconfigure
 
 如果检测到旧脚本安装在 `/usr/local` 下的源码版 Libreswan，安装器会停止：需要先备份并按原安装记录卸载源码版，再安装系统软件包，避免两个 IPsec 实现争用配置和端口。检测到 strongSwan、firewalld、启用的 nftables 服务或额外原生 nftables 表时也会停止，不自动替换其他服务。
 
-本次以 `codex/l2tp-auto-setup-20261030` 的 `07b502b` 恢复安装器。账号、密码、PSK、原有 IKE 提议、PPP、镜像回退和防火墙流程沿用该分支，并加入公网 IP 与端口交互。
+秋水逸冰原版固定使用 Libreswan 3.27。本二次开发版选择 4.15，并对已抓包确认的爱快零秒 IKE 寿命加入兼容处理。编译源码中的零寿命会使用上游默认寿命，再由本地配置上限约束，非零寿命按上游处理。该修改在脚本中明确标注，属于本仓库补丁。运行文件位于 `/opt/l2tp-libreswan/4.15-ikuai1`，配置和旧服务单元在切换前备份。系统安装的原有 Libreswan 软件包保留供回退。首次编译需要数分钟。
 
 对于本次简化版生成的 `/etc/l2tp-deploy/client.txt`，安装器可识别单账户部署，核对连接信息与实际凭据一致后备份并迁移，保留原用户名、密码、PSK、端口和地址池，替换旧版专用网络服务。迁移期间 VPN 会短暂中断。如需重新交互选择，执行 `sudo bash l2tp.sh --reconfigure`。复杂或不一致的配置会停止，需人工核对。
 
@@ -126,4 +126,6 @@ shellcheck l2tp.sh
 python3 -m unittest discover -s tests -v
 ```
 
-自动化测试覆盖生成值、转义、配置保留/重新生成、网络冲突、源重试/回退、UFW 合并和专用链幂等性。CI 在 Ubuntu 22.04/24.04 检查真实组件配置，并在隔离网络与挂载命名空间验证 iptables、已启用 UFW 的放行及重载；CI 通过仍不能代替实际服务器重启和爱快拨号测试。
+自动化测试覆盖生成值、转义、配置保留/重新生成、网络冲突、源重试/回退、UFW 合并和专用链幂等性。CI 在 Ubuntu 22.04/24.04 编译固定的 Libreswan 4.15，检查真实组件配置，并在隔离网络与挂载命名空间验证 iptables、已启用 UFW 的放行及重载；CI 通过仍不能代替实际服务器重启和爱快拨号测试。
+
+测试还在隔离网络中发送带零寿命的 IKEv1/PSK 提议，完成双方认证后检查会话继续存活。真实爱快获取本地 IP 与实际通流量仍需现场验收。

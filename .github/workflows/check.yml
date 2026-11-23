@@ -20,7 +20,9 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck libreswan xl2tpd ppp iptables ufw
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck libreswan xl2tpd ppp iptables ufw gcc make flex bison pkg-config libnss3-dev libnss3-tools libnspr4-dev libpam0g-dev libcap-ng-dev libevent-dev libsystemd-dev python3-cryptography
+      - name: Build isolated Libreswan 4.15 compatibility core
+        run: sudo bash l2tp.sh --build-only
       - name: Syntax and ShellCheck
         run: |
           bash -n l2tp.sh tests/integration.sh

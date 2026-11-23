@@ -10,8 +10,13 @@ mount --make-rprivate /
 source ./l2tp.sh
 WORK_DIR=$(mktemp -d)
 daemon_pid=
+pluto_pid=
+client_ns=
 finish() {
     if [[ -n $daemon_pid ]]; then kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true; fi
+    if [[ -n $pluto_pid ]]; then kill "$pluto_pid" 2>/dev/null || true; wait "$pluto_pid" 2>/dev/null || true; fi
+    if [[ -n $client_ns ]]; then ip netns delete "$client_ns" || true; fi
+    if [[ -f "$WORK_DIR/pluto.log" ]]; then cat "$WORK_DIR/pluto.log"; fi
     rm -rf -- "$WORK_DIR"
 }
 trap finish EXIT
@@ -88,3 +93,52 @@ iptables -C ufw-user-input -p tcp --dport 22 -j ACCEPT
 [[ $(iptables -S ufw-before-input | grep -c -- '-j L2TP-IN') == 1 ]]
 [[ $(iptables -S L2TP-IN | grep -c -- '^-A ') == 4 ]]
 echo 'IPsec/xl2tpd configuration and isolated iptables/active UFW checks passed.'
+
+# Reproduce the captured iKuai zero-duration IKEv1 PSK offer.
+client_ns=l2tp-zero-$$
+ip netns add "$client_ns"
+ip link add zero-server type veth peer name zero-client
+ip link set zero-client netns "$client_ns"
+ip address add 198.19.0.1/24 dev zero-server
+ip link set zero-server up
+# Keep the protocol test independent of the earlier synthetic INPUT DROP.
+iptables -I INPUT 1 -i zero-server -p udp --dport 500 -j ACCEPT
+ip netns exec "$client_ns" ip link set lo up
+ip netns exec "$client_ns" ip address add 198.19.0.2/24 dev zero-client
+ip netns exec "$client_ns" ip link set zero-client up
+mkdir -p "$WORK_DIR/nss" "$WORK_DIR/pluto"
+certutil -N -d "sql:$WORK_DIR/nss" --empty-password
+cat > "$WORK_DIR/zero.conf" <<'EOF'
+config setup
+    ikev1-policy=accept
+conn zero-test
+    authby=secret
+    ikev2=never
+    type=transport
+    left=198.19.0.1
+    leftprotoport=17/18563
+    right=%any
+    rightprotoport=17/%any
+    ike=aes128-sha2_256;modp3072
+    esp=aes128-sha2_256
+    rekey=no
+    ikelifetime=8h
+    auto=add
+EOF
+printf '%%any %%any : PSK "ZeroLifetimeTest123"\n' > "$WORK_DIR/zero.secrets"
+"$LIBRESWAN_PREFIX/libexec/ipsec/pluto" --nofork --stderrlog \
+    --config "$WORK_DIR/zero.conf" --secretsfile "$WORK_DIR/zero.secrets" \
+    --nssdir "$WORK_DIR/nss" --rundir "$WORK_DIR/pluto" > "$WORK_DIR/pluto.log" 2>&1 &
+pluto_pid=$!
+for attempt in {1..50}; do
+    [[ -S "$WORK_DIR/pluto/pluto.ctl" ]] && break
+    sleep 0.2
+done
+"$LIBRESWAN_PREFIX/libexec/ipsec/addconn" --config "$WORK_DIR/zero.conf" --ctlsocket "$WORK_DIR/pluto/pluto.ctl" --autoall
+ip netns exec "$client_ns" python3 tests/ike_zero_lifetime.py 198.19.0.1 198.19.0.2 ZeroLifetimeTest123
+sleep 3
+"$LIBRESWAN_PREFIX/libexec/ipsec/whack" --ctlsocket "$WORK_DIR/pluto/pluto.ctl" --status > "$WORK_DIR/zero-status"
+grep -E '(ISAKMP|IKE) SA established' "$WORK_DIR/zero-status"
+grep -F 'zero IKE lifetime normalized' "$WORK_DIR/pluto.log"
+if grep -F 'IKE SA expired' "$WORK_DIR/pluto.log"; then exit 1; fi
+echo 'PASS zero-lifetime IKE SA survives authentication'
