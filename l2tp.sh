@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Ubuntu 22.04/24.04 L2TP/IPsec installer for iKuai.
-# Original repository: https://github.com/kill613/l2tp
+# Derived from Teddysun's L2TP VPN Auto Installer (Apache-2.0).
+# Author: Teddysun <i@teddysun.com>
+# Intro: https://teddysun.com/448.html
+# Upstream: https://github.com/teddysun/across/blob/master/l2tp.sh
+# Modified by kill613, 2026-11-23: Ubuntu, secure defaults, random ports,
+# staged Libreswan 4.15 build, zero-lifetime compatibility, rollback.
+# Modifications and original attribution are documented in NOTICE.
 set -Eeuo pipefail
 export LC_ALL=C
 umask 077
@@ -8,6 +13,10 @@ umask 077
 CONFIG_DIR=/etc/l2tp-installer
 CONFIG_FILE=$CONFIG_DIR/config
 RUNTIME=/usr/local/libexec/l2tp-installer
+LIBRESWAN_PREFIX=/opt/l2tp-libreswan/4.15-ikuai1
+IPSEC_BIN=/usr/sbin/ipsec
+[[ ! -x $LIBRESWAN_PREFIX/sbin/ipsec ]] || IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
+ipsec() { "$IPSEC_BIN" "$@"; }
 RECONFIGURE=0
 WORK_DIR=
 BACKUP_DIR=
@@ -408,7 +417,8 @@ try_mirror() {
         chmod 755 "$WORK_DIR/lists" "$WORK_DIR/lists/partial" || return 1
         if timeout 300 apt-get "${APT_OPTS[@]}" update &&
             DEBIAN_FRONTEND=noninteractive timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-remove --no-install-recommends \
-                libreswan xl2tpd ppp iptables python3 curl ca-certificates; then
+                libreswan xl2tpd ppp iptables python3 curl ca-certificates gcc make flex bison pkg-config \
+                libnss3-dev libnss3-tools libnspr4-dev libpam0g-dev libcap-ng-dev libevent-dev libsystemd-dev; then
             return 0
         fi
         if ((attempt < 3)); then sleep "$((attempt * 2))"; fi
@@ -509,7 +519,7 @@ backup_files() {
     for path in /etc/l2tp-deploy/client.txt /usr/local/libexec/l2tp-network /etc/systemd/system/l2tp-network.service \
         /etc/systemd/system/ipsec.service.d/80-l2tp-network.conf /etc/systemd/system/xl2tpd.service.d/80-l2tp-network.conf "$CONFIG_FILE" "$RUNTIME" /etc/ipsec.conf /etc/ipsec.secrets /etc/xl2tpd/xl2tpd.conf \
         /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets /etc/ufw/before.rules \
-        /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
+        /etc/systemd/system/ipsec.service /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
         /etc/systemd/system/ipsec.service.d/l2tp-installer.conf /etc/systemd/system/xl2tpd.service.d/l2tp-installer.conf; do
         printf '%s\n' "$path" >> "$BACKUP_DIR/manifest"
         if [[ -e $path ]]; then
@@ -531,37 +541,106 @@ backup_files() {
 
 configure_ipsec_version() {
     local version
-    version=$(dpkg-query -W -f='${Version}' libreswan)
+    if [[ $IPSEC_BIN == "$LIBRESWAN_PREFIX/sbin/ipsec" ]]; then
+        version=4.15
+    else
+        version=$(dpkg-query -W -f='${Version}' libreswan)
+    fi
     IKEV1_POLICY_LINE=''
-    # Jammy ships 3.32 (no global IKEv1 switch); Noble ships 4.14.
     if dpkg --compare-versions "$version" ge 4.5; then IKEV1_POLICY_LINE='    ikev1-policy=accept'; fi
+}
+
+download_file() {
+    local destination=$1 url
+    local digest=82bebab53d47c1e229a8fe99a939c49c1651de1f7b8c9159ec1c552cc9c3bc64
+    for url in \
+        https://ghfast.top/https://github.com/libreswan/libreswan/archive/refs/tags/v4.15.tar.gz \
+        https://codeload.github.com/libreswan/libreswan/tar.gz/refs/tags/v4.15; do
+        if curl -fL --connect-timeout 8 --max-time 120 --retry 2 "$url" -o "$destination" &&
+           printf '%s  %s\n' "$digest" "$destination" | sha256sum -c -; then return; fi
+        log '下载或固定摘要校验失败，尝试下一下载渠道。'
+    done
+    die 'Libreswan 4.15 源码下载失败。'
+}
+
+compile_install() {
+    if [[ -x $LIBRESWAN_PREFIX/sbin/ipsec && -f $LIBRESWAN_PREFIX/ikuai-zero-lifetime-v1 ]]; then
+        IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
+        return
+    fi
+    local source=$WORK_DIR/libreswan-4.15
+    download_file "$WORK_DIR/libreswan.tar.gz"
+    tar -xzf "$WORK_DIR/libreswan.tar.gz" -C "$WORK_DIR"
+    # The unmodified 4.x parser also accepts a peer's zero lifetime. Normalize
+    # that invalid duration to the configured bound, preserving nonzero values.
+    python3 - "$source/programs/pluto/ikev1_spdb_struct.c" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "\t\t\t\t\tta.life_seconds = deltatime(val);"
+new = """\t\t\t\t\tif (val == 0) {
+\t\t\t\t\t\tval = IKE_SA_LIFETIME_DEFAULT;
+\t\t\t\t\t\tlog_state(RC_LOG, st, "iKuai compatibility: zero IKE lifetime normalized to default");
+\t\t\t\t\t}
+""" + old
+if text.count(old) != 1:
+    sys.exit("Libreswan 源码与预期不符，停止编译")
+path.write_text(text.replace(old, new))
+PY
+    cat > "$source/Makefile.inc.local" <<EOF
+PREFIX=$LIBRESWAN_PREFIX
+WERROR_CFLAGS=
+USE_DNSSEC=false
+USE_LIBCURL=false
+USE_LDAP=false
+USE_NM=false
+INITSYSTEM=systemd
+EOF
+    log '编译 Libreswan 4.15，首次安装可能需要数分钟。'
+    make -C "$source" -j2 base > "$WORK_DIR/build.log" 2>&1 ||
+        { tail -n 60 "$WORK_DIR/build.log" >&2; die 'Libreswan 编译失败。'; }
+    make -C "$source" DESTDIR="$WORK_DIR/stage" install-base >> "$WORK_DIR/build.log" 2>&1 ||
+        { tail -n 60 "$WORK_DIR/build.log" >&2; die 'Libreswan 暂存安装失败。'; }
+    local target=$WORK_DIR/stage$LIBRESWAN_PREFIX
+    [[ -x $target/sbin/ipsec && -x $target/libexec/ipsec/pluto ]] || die '编译产物缺失。'
+    install -d -m 755 "$LIBRESWAN_PREFIX"
+    cp -a "$target/." "$LIBRESWAN_PREFIX/"
+    IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
+    ipsec --version | grep -F '4.15' >/dev/null || die 'Libreswan 版本检查失败。'
+    touch "$LIBRESWAN_PREFIX/ikuai-zero-lifetime-v1"
 }
 
 render_configs() {
     local dest=$1
     mkdir -p "$dest"
     cat > "$dest/ipsec.conf" <<EOF
-# Managed by l2tp-installer
+# Derived from Teddysun's config_install(), adapted for iKuai.
 config setup
     uniqueids=no
 ${IKEV1_POLICY_LINE:-}
+    virtual_private=%v4:10.0.0.0/8,%v4:192.168.0.0/16,%v4:172.16.0.0/12,%v4:!$VPN_CIDR
+
 conn l2tp-ikuai
     authby=secret
+    pfs=no
+    auto=add
+    keyingtries=3
+    rekey=no
+    ikelifetime=8h
+    salifetime=1h
     ikev2=never
     type=transport
     left=%defaultroute
     leftprotoport=17/$L2TP_PORT
     right=%any
     rightprotoport=17/%any
-    encapsulation=yes
-    pfs=no
-    rekey=no
-    ike=aes256-sha2_256;modp2048,aes128-sha2_256;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,aes128-sha2_256;modp3072
-    esp=aes256-sha2_256,aes128-sha2_256,aes256-sha1,aes128-sha1
-    dpddelay=30
-    dpdtimeout=120
+    dpddelay=40
+    dpdtimeout=130
     dpdaction=clear
-    auto=add
+    encapsulation=yes
+    ike=aes128-sha2_256;modp3072,aes256-sha2_256;modp2048,aes128-sha2_256;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048
+    esp=aes256-sha2_256,aes128-sha2_256,aes256-sha1,aes128-sha1
 EOF
     # Hex encoding avoids quote/escape ambiguities in Libreswan PSK parsing.
     printf ': PSK 0x%s\n' "$(printf '%s' "$IPSEC_PSK" | od -An -tx1 | tr -d ' \n')" > "$dest/ipsec.secrets"
@@ -576,7 +655,7 @@ local ip = $VPN_LOCAL_IP
 require chap = yes
 refuse pap = yes
 require authentication = yes
-name = L2TP-VPN-Server
+name = l2tpd
 ppp debug = no
 pppoptfile = /etc/ppp/options.xl2tpd
 length bit = yes
@@ -588,8 +667,10 @@ ms-dns 223.5.5.5
 ms-dns 1.1.1.1
 noccp
 auth
+require-mschap-v2
 refuse-pap
 refuse-eap
+hide-password
 mtu 1400
 mru 1400
 nodefaultroute
@@ -747,6 +828,20 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+    cat > /etc/systemd/system/ipsec.service <<EOF
+[Unit]
+Description=Libreswan 4.15 iKuai compatibility
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=simple
+ExecStartPre=$IPSEC_BIN --checknss
+ExecStart=$LIBRESWAN_PREFIX/libexec/ipsec/pluto --config /etc/ipsec.conf --nofork
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
     local unit
     for unit in ipsec xl2tpd; do
         cat > "/etc/systemd/system/$unit.service.d/l2tp-installer.conf" <<'EOF'
@@ -828,6 +923,7 @@ main() {
             --reconfigure) RECONFIGURE=1 ;;
             --apply-firewall) mode=firewall ;;
             --diagnose) mode=diagnose ;;
+            --build-only) mode=build ;;
             --help|-h)
                 printf '用法：sudo bash l2tp.sh [--reconfigure|--diagnose]\n环境变量：VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT VPN_PUBLIC_IP VPN_LOCAL_IP VPN_CIDR VPN_IP_RANGE NONINTERACTIVE=1\n重复运行保留原配置；--reconfigure 重新输入账户并生成新的默认密码、PSK 和端口。\n'
                 return ;;
@@ -848,6 +944,12 @@ main() {
         apply_firewall
         return
     fi
+    if [[ $mode == build ]]; then
+        [[ $(id -u) == 0 ]] || die '编译安装需要 root。'
+        WORK_DIR=$(mktemp -d /tmp/l2tp-build.XXXXXXXX)
+        compile_install
+        return
+    fi
     STEP=安装前检查
     preflight
     detect_existing
@@ -863,6 +965,8 @@ main() {
     chmod 711 "$WORK_DIR"
     STEP=优选软件源及安装依赖
     install_packages
+    STEP=编译安装IPsec核心
+    compile_install
     configure_ipsec_version
     if (( RECENT )); then
         import_recent

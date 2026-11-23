@@ -1,0 +1,6 @@
+Derived from Teddysun L2TP VPN Auto Installer.
+Author: Teddysun <i@teddysun.com>
+https://teddysun.com/448.html
+https://github.com/teddysun/across/blob/master/l2tp.sh
+Modified by kill613 in 2026 for Ubuntu and iKuai requirements.
+The Libreswan compatibility modification is documented in l2tp.sh.

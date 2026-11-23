@@ -45,6 +45,8 @@ class InstallerTests(unittest.TestCase):
         prelude = r'''
 source ./l2tp.sh
 ask_server_ip() { :; }
+compile_install() { :; }
+IPSEC_BIN=/usr/sbin/ipsec
 WORK_DIR=$TEST_TMP
 if command -v cygpath >/dev/null; then
     WORK_DIR=$(cygpath -u "$TEST_TMP")
