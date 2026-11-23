@@ -29,3 +29,40 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Actual component and firewall checks in isolated network
         run: sudo bash tests/integration.sh
+
+  debian:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [bookworm, trixie]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install dependencies and validate on Debian
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          sudo modprobe dummy
+          docker run --rm --privileged -v "$PWD:/repo:ro" -w /repo "debian:$SUITE" bash -Eeuo pipefail -c '
+            source ./l2tp.sh
+            source /etc/os-release
+            select_distribution "$ID" "$VERSION_ID"
+            WORK_DIR=$(mktemp -d)
+            trap '\''rm -rf -- "$WORK_DIR"'\'' EXIT
+            chmod 711 "$WORK_DIR"
+            apt_options
+            create_package_policy
+            try_mirror http://deb.debian.org/debian http://deb.debian.org/debian-security
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends shellcheck ufw systemd
+            bash -n l2tp.sh
+            bash -n tests/integration.sh
+            shellcheck -x l2tp.sh tests/integration.sh
+            PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+            systemctl --root=/ enable ipsec.service xl2tpd.service
+            systemctl --root=/ is-enabled ipsec.service
+            systemctl --root=/ is-enabled xl2tpd.service
+            bash tests/integration.sh
+          '

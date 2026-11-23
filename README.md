@@ -1,6 +1,6 @@
-# Ubuntu L2TP/IPsec 一键安装
+# Debian / Ubuntu L2TP/IPsec 一键安装
 
-适用于 **Ubuntu 22.04 / 24.04，amd64 / arm64，systemd**，面向爱快路由器的 L2TP 客户端。通过 Ubuntu 软件包安装 Libreswan、xl2tpd、PPP，无需编译。
+适用于 **Debian 12 / 13 或 Ubuntu 22.04 / 24.04，amd64 / arm64，systemd**，面向爱快路由器的 L2TP 客户端。通过发行版软件包安装 Libreswan、xl2tpd、PPP，无需编译。
 
 ## 安装
 
@@ -89,11 +89,11 @@ sudo env NONINTERACTIVE=1 bash l2tp.sh --reconfigure
 
 - 自动识别 IPv4 出口网卡，使用 MASQUERADE 转发客户端流量，适配 `ens3`、`enp1s0` 等网卡名及云主机私网地址。
 - 自动设置 IPv4 转发，配置 UDP 500/4500 与 ESP 协议（不是 TCP/UDP 50 端口）；随机 L2TP 端口只接收经 IPsec 保护的数据，拒绝裸 L2TP。
-- UFW 已启用时，在 `before.rules` 中维护带标记的专用规则，支持 UFW 重载；否则使用 iptables 专用链（包括 Ubuntu 的 iptables-nft 后端）。不清空其他规则、不启停 UFW、不改变 SSH 规则。
+- UFW 已启用时，在 `before.rules` 中维护带标记的专用规则，支持 UFW 重载；否则使用 iptables 专用链（包括 Debian 和 Ubuntu 的 iptables-nft 后端）。不清空其他规则、不启停 UFW、不改变 SSH 规则。
 - 启用 `ipsec`、`xl2tpd`、`l2tp-firewall` 开机启动；规则恢复先于 VPN 服务执行。服务退出异常时自动重启，重复运行不重复添加规则。
 - 云安全组、运营商过滤与上游路由器无法由本机规则控制。使用 IPsec UDP 封装时，上游通常只需允许/映射 UDP 500/4500；随机 L2TP 端口在服务器解密后匹配，无需直接向公网开放裸 L2TP。仅修改本机防火墙不代表已修改云安全组。
-- 安装时对清华、中科大、阿里云镜像进行限时 InRelease 下载并验证 Ubuntu 签名，按耗时优选；实际更新或安装失败，每个候选最多尝试三次，再尝试下一镜像，最后回退官方源。
-- 分别处理 `jammy/noble`、`ubuntu/ubuntu-ports`，使用临时 APT 源和独立索引，不永久改写系统软件源，不执行整机升级，不关闭签名校验。
+- 安装时对清华、中科大、阿里云镜像进行限时 InRelease 下载并验证对应发行版的签名，按耗时优选；实际更新或安装失败，每个候选最多尝试三次，再尝试下一镜像，最后回退官方源。
+- 分别处理 Debian `bookworm/trixie`、Ubuntu `jammy/noble` 及对应架构的软件源，使用临时 APT 源和独立索引，不永久改写系统软件源，不执行整机升级，不关闭签名校验。
 - 失败时输出具体步骤，不宣告安装成功。修改配置后的失败会尝试恢复备份、原服务状态和本脚本管理的规则；软件包安装本身不会自动卸载回滚。请检查恢复输出。
 
 ## 排障与验证
@@ -101,7 +101,7 @@ sudo env NONINTERACTIVE=1 bash l2tp.sh --reconfigure
 ```bash
 sudo systemctl status ipsec xl2tpd l2tp-firewall --no-pager
 sudo journalctl -u ipsec -u xl2tpd -u l2tp-firewall -n 100 --no-pager
-sudo ipsec auto --status
+sudo ipsec whack --status
 sudo ss -luntp
 sudo iptables -S L2TP-IN
 sudo iptables -S L2TP-FWD
@@ -119,4 +119,4 @@ shellcheck l2tp.sh
 python3 -m unittest discover -s tests -v
 ```
 
-自动化测试覆盖生成值、转义、配置保留/重新生成、网络冲突、源重试/回退、UFW 合并和专用链幂等性。CI 在 Ubuntu 22.04/24.04 检查真实组件配置，并在隔离网络与挂载命名空间验证 iptables、已启用 UFW 的放行及重载；CI 通过仍不能代替实际服务器重启和爱快拨号测试。
+自动化测试覆盖生成值、转义、配置保留/重新生成、网络冲突、源重试/回退、UFW 合并和专用链幂等性。CI 在 Debian 12/13 容器及 Ubuntu 22.04/24.04 检查真实组件配置，并在隔离网络与挂载命名空间验证 iptables、已启用 UFW 的放行及重载；CI 通过仍不能代替实际服务器重启和爱快拨号测试。

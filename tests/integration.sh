@@ -30,6 +30,11 @@ ipsec addconn --config "$WORK_DIR/render/ipsec.conf" --checkconfig
 ip link set lo up
 ip link add ens3 type dummy
 ip link set ens3 up
+ip address add 198.18.0.1/24 dev ens3
+ip route add default via 198.18.0.254 dev ens3
+detect_egress
+[[ $EGRESS_IF == ens3 ]]
+validate_network
 iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 iptables -A INPUT -j DROP
 iptables -t nat -A POSTROUTING -s 10.73.0.0/24 -j MASQUERADE
@@ -72,8 +77,6 @@ ss -H -luntp | grep ':18562 ' >/dev/null
 remove_owned_firewall
 cp -a /etc/ufw "$WORK_DIR/ufw"
 mount --bind "$WORK_DIR/ufw" /etc/ufw
-ip address add 198.18.0.1/24 dev ens3
-ip route add default via 198.18.0.254 dev ens3
 ufw allow 22/tcp
 ufw --force enable
 OLD_BACKEND=ufw

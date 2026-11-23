@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ubuntu 22.04/24.04 L2TP/IPsec installer for iKuai.
+# Debian 12/13 and Ubuntu 22.04/24.04 L2TP/IPsec installer for iKuai.
 # Original repository: https://github.com/kill613/l2tp
 set -Eeuo pipefail
 export LC_ALL=C
@@ -182,20 +182,33 @@ detect_backend() {
     [[ -z $OLD_BACKEND || $OLD_BACKEND == "$FIREWALL_BACKEND" ]] || die '防火墙管理方式已变化，请先迁移原有规则。'
 }
 
+select_distribution() {
+    case "${1:-}:${2:-}" in
+        debian:12) CODENAME=bookworm ;;
+        debian:13) CODENAME=trixie ;;
+        ubuntu:22.04) CODENAME=jammy ;;
+        ubuntu:24.04) CODENAME=noble ;;
+        *) die '仅支持 Debian 12/13 或 Ubuntu 22.04/24.04。' ;;
+    esac
+    DISTRO=$1
+    ARCHIVE_KEYRING=/usr/share/keyrings/$DISTRO-archive-keyring.gpg
+    APT_COMPONENTS=main
+    if [[ $DISTRO == ubuntu ]]; then APT_COMPONENTS='main universe'; fi
+}
+
 preflight() {
     [[ $(id -u) == 0 ]] || die '请使用 root 或 sudo bash l2tp.sh 运行。'
     [[ -f /etc/os-release ]] || die '无法识别系统。'
     # shellcheck disable=SC1091
     source /etc/os-release
-    [[ $ID == ubuntu && ($VERSION_ID == 22.04 || $VERSION_ID == 24.04) ]] || die '仅支持 Ubuntu 22.04/24.04。'
-    CODENAME=$VERSION_CODENAME
+    select_distribution "${ID:-}" "${VERSION_ID:-}"
     ARCH=$(dpkg --print-architecture)
     [[ $ARCH == amd64 || $ARCH == arm64 ]] || die '仅支持 amd64/arm64。'
-    [[ -d /run/systemd/system ]] || die '需要运行 systemd 的完整 Ubuntu 系统。'
+    [[ -d /run/systemd/system ]] || die '需要运行 systemd 的完整 Debian 或 Ubuntu 系统。'
     [[ -f ${BASH_SOURCE[0]} ]] || die '请先下载脚本到文件后再运行。'
     local command_name
-    for command_name in ip ss flock timeout gpgv; do command -v "$command_name" >/dev/null || die "缺少基础命令 $command_name。"; done
-    [[ -x /usr/lib/apt/apt-helper && -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]] || die '缺少 APT 下载组件或 Ubuntu 签名密钥。'
+    for command_name in flock timeout gpgv sysctl; do command -v "$command_name" >/dev/null || die "缺少基础命令 $command_name。"; done
+    [[ -x /usr/lib/apt/apt-helper && -r $ARCHIVE_KEYRING ]] || die '缺少 APT 下载组件或发行版签名密钥。'
     exec 9>/run/lock/l2tp-installer.lock
     flock -n 9 || die '另一安装进程正在运行。'
     for command_name in strongswan-starter strongswan-charon charon-systemd; do
@@ -290,9 +303,9 @@ apt_options() {
 write_sources() {
     local base=$1 security=$2
     cat > "$WORK_DIR/sources.list" <<EOF
-deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] $base $CODENAME main universe
-deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] $base $CODENAME-updates main universe
-deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] $security $CODENAME-security main universe
+deb [signed-by=$ARCHIVE_KEYRING] $base $CODENAME $APT_COMPONENTS
+deb [signed-by=$ARCHIVE_KEYRING] $base $CODENAME-updates $APT_COMPONENTS
+deb [signed-by=$ARCHIVE_KEYRING] $security $CODENAME-security $APT_COMPONENTS
 EOF
 }
 
@@ -307,7 +320,7 @@ try_mirror() {
         chmod 755 "$WORK_DIR/lists" "$WORK_DIR/lists/partial" || return 1
         if timeout 300 apt-get "${APT_OPTS[@]}" update &&
             DEBIAN_FRONTEND=noninteractive timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-remove --no-install-recommends \
-                libreswan xl2tpd ppp iptables python3 curl ca-certificates; then
+                libreswan xl2tpd ppp iproute2 iptables python3 curl ca-certificates; then
             return 0
         fi
         if ((attempt < 3)); then sleep "$((attempt * 2))"; fi
@@ -317,8 +330,12 @@ try_mirror() {
 
 install_packages() {
     local suffix official security base started elapsed _elapsed
-    local -a candidates
-    if [[ $ARCH == amd64 ]]; then
+    local -a candidates security_candidates
+    if [[ $DISTRO == debian ]]; then
+        suffix=debian
+        official=http://deb.debian.org/debian
+        security=http://deb.debian.org/debian-security
+    elif [[ $ARCH == amd64 ]]; then
         suffix=ubuntu
         official=http://archive.ubuntu.com/ubuntu
         security=http://security.ubuntu.com/ubuntu
@@ -328,23 +345,29 @@ install_packages() {
         security=$official
     fi
     candidates=("https://mirrors.tuna.tsinghua.edu.cn/$suffix" "https://mirrors.ustc.edu.cn/$suffix" "https://mirrors.aliyun.com/$suffix")
+    local idx
+    for idx in "${!candidates[@]}"; do
+        security_candidates[idx]=${candidates[idx]}
+        if [[ $DISTRO == debian ]]; then security_candidates[idx]+=-security; fi
+    done
     create_package_policy
     : > "$WORK_DIR/ranking"
-    for base in "${candidates[@]}"; do
+    for idx in "${!candidates[@]}"; do
+        base=${candidates[idx]}
         started=$(date +%s%N)
         if probe_mirror "$base"; then
             elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
             log "镜像探测：$base，签名有效，${elapsed}ms"
-            printf '%s %s\n' "$elapsed" "$base" >> "$WORK_DIR/ranking"
+            printf '%s %s\n' "$elapsed" "$idx" >> "$WORK_DIR/ranking"
         else
             log "镜像暂不可用：$base；保留为后续重试候选。"
-            printf '999999 %s\n' "$base" >> "$WORK_DIR/ranking"
+            printf '999999 %s\n' "$idx" >> "$WORK_DIR/ranking"
         fi
         rm -f -- "$WORK_DIR/probe"
     done
     apt_options
-    while read -r _elapsed base; do
-        if try_mirror "$base" "$base"; then finish_package_install; return; fi
+    while read -r _elapsed idx; do
+        if try_mirror "${candidates[idx]}" "${security_candidates[idx]}"; then finish_package_install; return; fi
     done < <(sort -sn -k1,1 "$WORK_DIR/ranking")
     if try_mirror "$official" "$security"; then finish_package_install; return; fi
     die '所有镜像及官方源均安装失败。请检查上方 APT 错误、DNS、网络和软件包锁。'
@@ -353,7 +376,7 @@ install_packages() {
 probe_mirror() {
     timeout 20 /usr/lib/apt/apt-helper -o Acquire::Retries=0 -o Acquire::https::Timeout=8 \
         download-file "$1/dists/$CODENAME/InRelease" "$WORK_DIR/probe" >/dev/null 2>&1 &&
-        gpgv --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg "$WORK_DIR/probe" >/dev/null 2>&1
+        gpgv --keyring "$ARCHIVE_KEYRING" "$WORK_DIR/probe" >/dev/null 2>&1
 }
 
 create_package_policy() {
@@ -431,6 +454,8 @@ configure_ipsec_version() {
     local version
     version=$(dpkg-query -W -f='${Version}' libreswan)
     IKEV1_POLICY_LINE=''
+    IKE_VERSION_LINE='    ikev2=never'
+    if dpkg --compare-versions "$version" ge 5.0; then IKE_VERSION_LINE='    keyexchange=ikev1'; fi
     # Jammy ships 3.32 (no global IKEv1 switch); Noble ships 4.14.
     if dpkg --compare-versions "$version" ge 4.5; then IKEV1_POLICY_LINE='    ikev1-policy=accept'; fi
 }
@@ -445,7 +470,7 @@ config setup
 ${IKEV1_POLICY_LINE:-}
 conn l2tp-ikuai
     authby=secret
-    ikev2=never
+${IKE_VERSION_LINE:-    ikev2=never}
     type=transport
     left=%defaultroute
     leftprotoport=17/$L2TP_PORT
@@ -658,8 +683,10 @@ EOF
     systemctl restart ipsec
     systemctl restart xl2tpd
     sleep 2
-    systemctl is-active --quiet l2tp-firewall ipsec xl2tpd
-    ipsec auto --status | grep '"l2tp-ikuai"' >/dev/null || die 'IPsec 未加载 l2tp-ikuai 连接。'
+    for unit in l2tp-firewall ipsec xl2tpd; do
+        systemctl is-active --quiet "$unit" || die "服务未运行：$unit。"
+    done
+    ipsec whack --status | grep -F '"l2tp-ikuai"' >/dev/null || die 'IPsec 未加载 l2tp-ikuai 连接。'
     ss -H -luntp | awk -v p="$L2TP_PORT" '$5 ~ (":" p "$") && /xl2tpd/ {ok=1} END {exit !ok}' || die 'xl2tpd 未监听预期端口。'
 }
 
