@@ -13,8 +13,8 @@ umask 077
 CONFIG_DIR=/etc/l2tp-installer
 CONFIG_FILE=$CONFIG_DIR/config
 RUNTIME=/usr/local/libexec/l2tp-installer
-LIBRESWAN_PREFIX=/opt/l2tp-libreswan/4.15-ikuai1
-IPSEC_BIN=/usr/sbin/ipsec
+LIBRESWAN_PREFIX=/opt/l2tp-libreswan/4.15-ikuai2
+IPSEC_BIN=$(command -v ipsec || printf '/usr/sbin/ipsec')
 [[ ! -x $LIBRESWAN_PREFIX/sbin/ipsec ]] || IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
 ipsec() { "$IPSEC_BIN" "$@"; }
 RECONFIGURE=0
@@ -258,7 +258,7 @@ preflight() {
             die '检测到 strongSwan，安装 Libreswan 会替换其他 IPsec 组件，请先处理现有部署。'
         fi
     done
-    if { [[ -x /usr/local/sbin/ipsec ]] && [[ $(readlink -f /usr/local/sbin/ipsec) != "$LIBRESWAN_PREFIX/sbin/ipsec" ]]; } || [[ -x /usr/local/libexec/ipsec/pluto ]]; then
+    if { [[ -x /usr/local/sbin/ipsec ]] && [[ $(readlink -f /usr/local/sbin/ipsec) != "$LIBRESWAN_PREFIX/sbin/ipsec" && $(readlink -f /usr/local/sbin/ipsec) != /opt/l2tp-libreswan/4.15-ikuai1/sbin/ipsec ]]; } || [[ -x /usr/local/libexec/ipsec/pluto ]]; then
         die '检测到旧版源码安装的 IPsec。请先备份并卸载该源码版本，避免与系统软件包同时运行。'
     fi
     detect_backend
@@ -564,7 +564,7 @@ download_file() {
 }
 
 compile_install() {
-    if [[ -x $LIBRESWAN_PREFIX/sbin/ipsec && -f $LIBRESWAN_PREFIX/ikuai-zero-lifetime-v1 ]]; then
+    if [[ -x $LIBRESWAN_PREFIX/sbin/ipsec && -f $LIBRESWAN_PREFIX/ikuai-zero-lifetime-v2 ]]; then
         IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
         return
     fi
@@ -580,13 +580,98 @@ path = Path(sys.argv[1])
 text = path.read_text()
 old = "\t\t\t\t\tta.life_seconds = deltatime(val);"
 new = """\t\t\t\t\tif (val == 0) {
-\t\t\t\t\t\tval = IKE_SA_LIFETIME_DEFAULT;
-\t\t\t\t\t\tlog_state(RC_LOG, st, "iKuai compatibility: zero IKE lifetime normalized to default");
+\t\t\t\t\t\tval = deltasecs(c->sa_ike_life_seconds);
+\t\t\t\t\t\tif (val == 0) val = IKE_SA_LIFETIME_DEFAULT;
+\t\t\t\t\t\tlog_state(RC_LOG, st, "iKuai compatibility: zero IKE lifetime normalized");
 \t\t\t\t\t}
 """ + old
 if text.count(old) != 1:
-    sys.exit("Libreswan 源码与预期不符，停止编译")
-path.write_text(text.replace(old, new))
+    sys.exit("Unexpected IKE lifetime source")
+text = text.replace(old, new)
+old = "\t\t\t\tattrs->life_seconds = val > lifemax ?"
+new = """\t\t\t\tif (val == 0) {
+\t\t\t\t\tval = deltasecs(st->st_connection->sa_ipsec_life_seconds);
+\t\t\t\t\tif (val == 0) val = IPSEC_SA_LIFETIME_DEFAULT;
+\t\t\t\t\tlog_state(RC_LOG, st, "iKuai compatibility: zero IPsec lifetime normalized");
+\t\t\t\t}
+""" + old
+if text.count(old) != 1:
+    sys.exit("Unexpected IPsec lifetime source")
+text = text.replace(old, new)
+
+helper = """
+/* Local iKuai compatibility patch. Emit a positive negotiated lifetime
+ * when the initiator offered zero. Leave the received SA bytes untouched:
+ * those bytes are needed for IKE authentication. Nonzero durations and
+ * all unrelated attributes are copied without modification. */
+static bool out_ikuai_lifetime_attrs(const uint8_t *data, size_t length,
+                                    pb_stream *out, unsigned life_type,
+                                    unsigned duration_type, uint32_t seconds)
+{
+        bool seconds_unit = false;
+        while (length > 0) {
+                if (length < 4) return false;
+                unsigned type = ((unsigned)data[0] << 8) | data[1];
+                unsigned field = ((unsigned)data[2] << 8) | data[3];
+                bool basic = (type & 0x8000) != 0;
+                size_t size = basic ? 4 : 4 + field;
+                if (size > length) return false;
+                type &= 0x7fff;
+                bool zero = basic ? field == 0 : true;
+                bool one = basic ? field == 1 : field > 0;
+                if (!basic) {
+                        for (size_t i = 4; i < size; i++) {
+                                zero = zero && data[i] == 0;
+                                one = one && data[i] == (i + 1 == size ? 1 : 0);
+                        }
+                }
+                if (type == life_type) seconds_unit = one;
+                if (type == duration_type && seconds_unit && zero) {
+                        uint8_t replacement[] = {
+                                duration_type >> 8, duration_type & 255, 0, 4,
+                                seconds >> 24, (seconds >> 16) & 255,
+                                (seconds >> 8) & 255, seconds & 255
+                        };
+                        if (!out_raw(replacement, sizeof(replacement), out,
+                                     "normalized lifetime")) return false;
+                } else {
+                        if (!out_raw(data, size, out, "attributes")) return false;
+                }
+                if (type == duration_type) seconds_unit = false;
+                data += size;
+                length -= size;
+        }
+        return true;
+}
+
+"""
+anchor = "v1_notification_t parse_isakmp_sa_body("
+if text.count(anchor) != 1:
+    sys.exit("Unexpected IKE parser entry")
+text = text.replace(anchor, helper + anchor)
+old = 'out_raw(attr_start, attr_len,\n\t\t\t\t\t\t&r_trans_pbs, "attributes")'
+new = 'out_ikuai_lifetime_attrs(attr_start, attr_len,\n\t\t\t\t\t\t&r_trans_pbs, OAKLEY_LIFE_TYPE,\n\t\t\t\t\t\tOAKLEY_LIFE_DURATION, deltasecs(ta.life_seconds))'
+if text.count(old) != 1:
+    sys.exit("Unexpected IKE response emitter")
+text = text.replace(old, new)
+old = 'struct logger *logger)\n{\n\tpb_stream r_proposal_pbs;'
+new = 'struct logger *logger, uint32_t life_seconds)\n{\n\tpb_stream r_proposal_pbs;'
+if text.count(old) != 1:
+    sys.exit("Unexpected Quick Mode response signature")
+text = text.replace(old, new)
+old = 'out_raw(trans_pbs->cur, pbs_left(trans_pbs),\n\t\t\t&r_trans_pbs, "attributes")'
+new = 'out_ikuai_lifetime_attrs(trans_pbs->cur, pbs_left(trans_pbs),\n\t\t\t&r_trans_pbs, SA_LIFE_TYPE, SA_LIFE_DURATION, life_seconds)'
+if text.count(old) != 1:
+    sys.exit("Unexpected Quick Mode response emitter")
+text = text.replace(old, new)
+for protocol in ("ah", "esp", "ipcomp"):
+    old = f'&{protocol}_trans_pbs,\n\t\t\t\t\t      &c->spd,\n\t\t\t\t\t      st->st_logger);'
+    new = old.replace('st->st_logger);', f'st->st_logger, deltasecs({protocol}_attrs.life_seconds));')
+    if text.count(old) != 1:
+        sys.exit(f"Unexpected {protocol} response call")
+    text = text.replace(old, new)
+path.write_text(text)
+
 PY
     cat > "$source/Makefile.inc.local" <<EOF
 PREFIX=$LIBRESWAN_PREFIX
@@ -609,7 +694,7 @@ EOF
     IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
     ipsec --version | grep -F '4.15' >/dev/null || die 'Libreswan 版本检查失败。'
     install -m 644 "$source/COPYING" "$LIBRESWAN_PREFIX/COPYING"
-    touch "$LIBRESWAN_PREFIX/ikuai-zero-lifetime-v1"
+    touch "$LIBRESWAN_PREFIX/ikuai-zero-lifetime-v2"
 }
 
 render_configs() {
