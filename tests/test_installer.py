@@ -203,6 +203,19 @@ detect_backend
             for pattern in (r"[A-Z]", r"[a-z]", r"[0-9]"):
                 self.assertRegex(value, pattern)
 
+    def test_interactive_summary_hides_secrets_and_requires_confirmation(self):
+        code = r'''
+SERVER_IP=8.8.4.4
+confirm_settings <<< ANSWER
+'''
+        result = self.shell(code.replace("ANSWER", "y"))
+        for value in ("8.8.4.4", "real", "18562", "500、4500", "192.168.18.1",
+                      "192.168.18.10-192.168.18.250", "223.5.5.5、1.1.1.1"):
+            self.assertIn(value, result.stdout)
+        self.assertNotIn("Abcdefghijk12345678", result.stdout)
+        self.assertNotIn("Abcdefghijklmnopqrstuvwxyz1234567", result.stdout)
+        self.shell(code.replace("ANSWER", "''"), ok=False)
+
     def test_empty_defaults_and_psk(self):
         self.shell(r'''
 unset VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT
@@ -406,7 +419,7 @@ main
 
     def test_mirror_retry_limit_and_recovery(self):
         self.shell(r'''
-CODENAME=noble
+select_distribution ubuntu 24.04
 apt_options
 timeout() { shift; "$@"; }
 sleep() { :; }
@@ -424,10 +437,34 @@ apt-get() { echo fail >> "$WORK_DIR/calls"; return 1; }
 [[ $(wc -l < "$WORK_DIR/calls") == 3 ]]
 ''')
 
+    def test_debian_security_sources(self):
+        for version, suite in (("12", "bookworm"), ("13", "trixie")):
+            with self.subTest(version=version):
+                self.shell(f"select_distribution debian {version}\nARCH=arm64\n" + r'''
+create_package_policy() { :; }
+finish_package_install() { :; }
+probe_mirror() { return 1; }
+try_mirror() {
+    [[ $2 == "$1-security" ]] || exit 2
+    printf '%s\n' "$1" >> "$WORK_DIR/mirrors"
+    [[ $1 == http://deb.debian.org/debian ]] || return 1
+    write_sources "$1" "$2"
+}
+install_packages
+[[ $(wc -l < "$WORK_DIR/mirrors") == 4 ]]
+''')
+                prefix = "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg]"
+                self.assertEqual((self.work / "sources.list").read_text().splitlines(), [
+                    f"{prefix} http://deb.debian.org/debian {suite} main",
+                    f"{prefix} http://deb.debian.org/debian {suite}-updates main",
+                    f"{prefix} http://deb.debian.org/debian-security {suite}-security main",
+                ])
+                (self.work / "mirrors").unlink()
+
     def test_mirror_fallback_and_architecture(self):
         for arch, expected in (("amd64", "http://archive.ubuntu.com/ubuntu"), ("arm64", "http://ports.ubuntu.com/ubuntu-ports")):
             with self.subTest(arch=arch):
-                self.shell(f"ARCH={arch}\nCODENAME=noble\n" + r'''
+                self.shell(f"ARCH={arch}\nselect_distribution ubuntu 24.04\n" + r'''
 create_package_policy() { :; }
 finish_package_install() { :; }
 probe_mirror() { return 1; }

@@ -25,6 +25,7 @@ COMMITTED=0
 POLICY_CREATED=0
 LEGACY=0
 RECENT=0
+XL2TPD_UNIT_CREATED=0
 SERVER_IP=${VPN_PUBLIC_IP:-}
 OLD_PORT=
 OLD_BACKEND=
@@ -44,6 +45,10 @@ cleanup() {
             log "正在恢复修改前的配置：$BACKUP_DIR"
             if [[ -n ${EGRESS_IF:-} && -n ${L2TP_PORT:-} && -n ${VPN_CIDR:-} ]]; then
                 relay_firewall remove || log 'L2TP 共存规则回收失败，请检查专用链。'
+            fi
+            if (( XL2TPD_UNIT_CREATED )); then
+                systemctl stop xl2tpd || true
+                systemctl disable xl2tpd || true
             fi
             while IFS= read -r path; do
                 if [[ -e $BACKUP_DIR/files$path ]]; then
@@ -200,6 +205,9 @@ PY
 
 ask_server_ip() {
     local answer url
+    if [[ -n $SERVER_IP ]] && ! valid_public_ip "$SERVER_IP"; then
+        die '公网 IPv4 无效，请检查 VPN_PUBLIC_IP。'
+    fi
     if [[ -z $SERVER_IP ]]; then
         for url in https://api.ipify.org https://ipv4.icanhazip.com; do
             answer=$(curl -4fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null || true)
@@ -247,6 +255,16 @@ ask_settings() {
     validate_values
 }
 
+confirm_settings() {
+    local answer
+    printf '\n===== 爱快 L2TP/IPsec 安装确认 =====\n'
+    printf '公网 IPv4：%s\n' "${SERVER_IP:-未检测到，拨号时填写服务器公网地址}"
+    printf '账户：%s\n密码：已设置（安装完成后显示）\nIPsec 预共享密钥（PSK）：已设置（安装完成后显示）\n' "$VPN_USER"
+    printf 'L2TP 端口：UDP %s\nIPsec 端口：UDP 500、4500\n' "$L2TP_PORT"
+    printf 'VPN 网关：%s\n客户端地址池：%s\nDNS：223.5.5.5、1.1.1.1\n\n' "$VPN_LOCAL_IP" "$VPN_IP_RANGE"
+    read -r -p '应用以上配置？[y/N]：' answer && [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]
+}
+
 detect_backend() {
     local rules
     if systemctl is-active --quiet firewalld || systemctl is-enabled --quiet firewalld 2>/dev/null; then
@@ -267,20 +285,33 @@ detect_backend() {
     [[ -z $OLD_BACKEND || $OLD_BACKEND == "$FIREWALL_BACKEND" ]] || die '防火墙管理方式已变化，请先迁移原有规则。'
 }
 
+select_distribution() {
+    case "${1:-}:${2:-}" in
+        debian:12) CODENAME=bookworm ;;
+        debian:13) CODENAME=trixie ;;
+        ubuntu:22.04) CODENAME=jammy ;;
+        ubuntu:24.04) CODENAME=noble ;;
+        *) die '仅支持 Debian 12/13 或 Ubuntu 22.04/24.04。' ;;
+    esac
+    DISTRO=$1
+    ARCHIVE_KEYRING=/usr/share/keyrings/$DISTRO-archive-keyring.gpg
+    APT_COMPONENTS=main
+    if [[ $DISTRO == ubuntu ]]; then APT_COMPONENTS='main universe'; fi
+}
+
 preflight() {
     [[ $(id -u) == 0 ]] || die '请使用 root 或 sudo bash l2tp.sh 运行。'
     [[ -f /etc/os-release ]] || die '无法识别系统。'
     # shellcheck disable=SC1091
     source /etc/os-release
-    [[ $ID == ubuntu && ($VERSION_ID == 22.04 || $VERSION_ID == 24.04) ]] || die '仅支持 Ubuntu 22.04/24.04。'
-    CODENAME=$VERSION_CODENAME
+    select_distribution "${ID:-}" "${VERSION_ID:-}"
     ARCH=$(dpkg --print-architecture)
     [[ $ARCH == amd64 || $ARCH == arm64 ]] || die '仅支持 amd64/arm64。'
-    [[ -d /run/systemd/system ]] || die '需要运行 systemd 的完整 Ubuntu 系统。'
+    [[ -d /run/systemd/system ]] || die '需要运行 systemd 的完整 Debian 或 Ubuntu 系统。'
     [[ -f ${BASH_SOURCE[0]} ]] || die '请先下载脚本到文件后再运行。'
     local command_name
-    for command_name in ip ss flock timeout gpgv; do command -v "$command_name" >/dev/null || die "缺少基础命令 $command_name。"; done
-    [[ -x /usr/lib/apt/apt-helper && -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]] || die '缺少 APT 下载组件或 Ubuntu 签名密钥。'
+    for command_name in flock timeout; do command -v "$command_name" >/dev/null || die "缺少基础命令 $command_name。"; done
+    [[ -x /usr/lib/apt/apt-helper && -r $ARCHIVE_KEYRING ]] || die '缺少 APT 下载组件或 发行版签名密钥。'
     exec 9>/run/lock/l2tp-installer.lock
     flock -n 9 || die '另一安装进程正在运行。'
     for command_name in strongswan-starter strongswan-charon charon-systemd; do
@@ -430,9 +461,9 @@ apt_options() {
 write_sources() {
     local base=$1 security=$2
     cat > "$WORK_DIR/sources.list" <<EOF
-deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] $base $CODENAME main universe
-deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] $base $CODENAME-updates main universe
-deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] $security $CODENAME-security main universe
+deb [signed-by=$ARCHIVE_KEYRING] $base $CODENAME $APT_COMPONENTS
+deb [signed-by=$ARCHIVE_KEYRING] $base $CODENAME-updates $APT_COMPONENTS
+deb [signed-by=$ARCHIVE_KEYRING] $security $CODENAME-security $APT_COMPONENTS
 EOF
 }
 
@@ -447,7 +478,7 @@ try_mirror() {
         chmod 755 "$WORK_DIR/lists" "$WORK_DIR/lists/partial" || return 1
         if timeout 300 apt-get "${APT_OPTS[@]}" update &&
             DEBIAN_FRONTEND=noninteractive timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-remove --no-install-recommends \
-                libreswan xl2tpd ppp iptables python3 curl ca-certificates gcc make flex bison pkg-config \
+                libreswan xl2tpd ppp iproute2 iptables procps python3 curl ca-certificates gcc make flex bison pkg-config \
                 libnss3-dev libnss3-tools libnspr4-dev libpam0g-dev libcap-ng-dev libevent-dev libsystemd-dev; then
             return 0
         fi
@@ -457,16 +488,20 @@ try_mirror() {
 }
 
 install_packages() {
-    local suffix official security base started elapsed _elapsed
+    local suffix official official_security security base started elapsed _elapsed
     local -a candidates
-    if [[ $ARCH == amd64 ]]; then
+    if [[ $DISTRO == debian ]]; then
+        suffix=debian
+        official=http://deb.debian.org/debian
+        official_security=http://deb.debian.org/debian-security
+    elif [[ $ARCH == amd64 ]]; then
         suffix=ubuntu
         official=http://archive.ubuntu.com/ubuntu
-        security=http://security.ubuntu.com/ubuntu
+        official_security=http://security.ubuntu.com/ubuntu
     else
         suffix=ubuntu-ports
         official=http://ports.ubuntu.com/ubuntu-ports
-        security=$official
+        official_security=$official
     fi
     candidates=("https://mirrors.tuna.tsinghua.edu.cn/$suffix" "https://mirrors.ustc.edu.cn/$suffix" "https://mirrors.aliyun.com/$suffix")
     create_package_policy
@@ -481,20 +516,29 @@ install_packages() {
             log "镜像暂不可用：$base；保留为后续重试候选。"
             printf '999999 %s\n' "$base" >> "$WORK_DIR/ranking"
         fi
-        rm -f -- "$WORK_DIR/probe"
+        rm -f -- "$WORK_DIR/probe" "$WORK_DIR/probe.clear"
     done
     apt_options
     while read -r _elapsed base; do
-        if try_mirror "$base" "$base"; then finish_package_install; return; fi
+        if [[ $DISTRO == debian ]]; then security=$base-security; else security=$base; fi
+        if try_mirror "$base" "$security"; then finish_package_install; return; fi
     done < <(sort -sn -k1,1 "$WORK_DIR/ranking")
-    if try_mirror "$official" "$security"; then finish_package_install; return; fi
+    if try_mirror "$official" "$official_security"; then finish_package_install; return; fi
     die '所有镜像及官方源均安装失败。请检查上方 APT 错误、DNS、网络和软件包锁。'
 }
 
 probe_mirror() {
-    timeout 20 /usr/lib/apt/apt-helper -o Acquire::Retries=0 -o Acquire::https::Timeout=8 \
+    local -a verifier
+    if command -v sqv >/dev/null; then
+        verifier=(sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output "$WORK_DIR/probe.clear")
+    elif command -v gpgv >/dev/null; then
+        verifier=(gpgv --keyring "$ARCHIVE_KEYRING")
+    else
+        return 1
+    fi
+    timeout 20 /usr/lib/apt/apt-helper -o Acquire::Retries=0 -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
         download-file "$1/dists/$CODENAME/InRelease" "$WORK_DIR/probe" >/dev/null 2>&1 &&
-        gpgv --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg "$WORK_DIR/probe" >/dev/null 2>&1
+        "${verifier[@]}" "$WORK_DIR/probe" >/dev/null 2>&1
 }
 
 create_package_policy() {
@@ -549,7 +593,7 @@ backup_files() {
     for path in /etc/systemd/system/sbm-relay-firewall.service.d/90-l2tp-coexist.conf /etc/l2tp-deploy/client.txt /usr/local/libexec/l2tp-network /etc/systemd/system/l2tp-network.service \
         /etc/systemd/system/ipsec.service.d/80-l2tp-network.conf /etc/systemd/system/xl2tpd.service.d/80-l2tp-network.conf "$CONFIG_FILE" "$RUNTIME" /etc/ipsec.conf /etc/ipsec.secrets /etc/xl2tpd/xl2tpd.conf \
         /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets /etc/ufw/before.rules \
-        /usr/local/sbin/ipsec /etc/systemd/system/ipsec.service /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
+        /usr/local/sbin/ipsec /etc/systemd/system/ipsec.service /etc/systemd/system/xl2tpd.service /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
         /etc/systemd/system/ipsec.service.d/l2tp-installer.conf /etc/systemd/system/xl2tpd.service.d/l2tp-installer.conf; do
         printf '%s\n' "$path" >> "$BACKUP_DIR/manifest"
         if [[ -e $path ]]; then
@@ -1007,7 +1051,31 @@ apply_firewall() {
     apply_forwarding
 }
 
+ensure_xl2tpd_unit() {
+    local directory
+    for directory in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        if [[ -e $directory/xl2tpd.service || -L $directory/xl2tpd.service ]]; then return; fi
+    done
+    # Some builds provide only an init.d script.
+    XL2TPD_UNIT_CREATED=1
+    cat > /etc/systemd/system/xl2tpd.service <<'EOF'
+[Unit]
+Description=L2TP tunneling daemon
+After=network.target
+
+[Service]
+Type=simple
+RuntimeDirectory=xl2tpd
+ExecStart=/usr/sbin/xl2tpd -D
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 /etc/systemd/system/xl2tpd.service
+}
+
 install_services() {
+    ensure_xl2tpd_unit
     mkdir -p /etc/systemd/system/{ipsec,xl2tpd}.service.d
     cat > /etc/systemd/system/l2tp-firewall.service <<EOF
 [Unit]
@@ -1070,7 +1138,9 @@ EOF
     systemctl restart ipsec
     systemctl restart xl2tpd
     sleep 2
-    systemctl is-active --quiet l2tp-firewall ipsec xl2tpd
+    for unit in l2tp-firewall ipsec xl2tpd; do
+        systemctl is-active --quiet "$unit" || die "服务未运行：$unit。"
+    done
     ipsec auto --status | grep '"l2tp-ikuai"' >/dev/null || die 'IPsec 未加载 l2tp-ikuai 连接。'
     ss -H -luntp | awk -v p="$L2TP_PORT" '$5 ~ (":" p "$") && /xl2tpd/ {ok=1} END {exit !ok}' || die 'xl2tpd 未监听预期端口。'
 }
@@ -1088,6 +1158,7 @@ show_result() {
     printf '服务器地址/域名：%s\n服务端口：%s（UDP）\n用户名：%s\n密码：%s\n预共享密钥：%s\n' \
         "${public_ip:-请填写服务器可达的公网 IP 或域名}" "$L2TP_PORT" "$VPN_USER" "$VPN_PASS" "$IPSEC_PSK"
     printf '本地标识/对方标识：留空\nMTU/MRU：1400\n'
+    printf 'VPN 网关：%s\n客户端地址池：%s\nDNS：223.5.5.5、1.1.1.1\n' "$VPN_LOCAL_IP" "$VPN_IP_RANGE"
     printf '云安全组/上游映射：UDP 500、4500；L2TP 数据使用端口 %s，服务器仅接受 IPsec 保护的数据。\n' "$L2TP_PORT"
     printf '已配置本机防火墙；未修改云安全组。IPsec 封装下，上游通常只需放行 UDP 500/4500。\n'
     printf '配置：%s（权限 600）\n备份：%s\n' "$CONFIG_FILE" "$BACKUP_DIR"
@@ -1124,12 +1195,13 @@ diagnose() {
 }
 
 main() {
-    local mode=install arg key
+    local mode=install arg key settings_changed=0
     # Preserve explicit environment overrides separately from stored state.
     declare -A overrides=()
     for key in "${KEYS[@]}"; do
-        if [[ -v $key && $key != FIREWALL_BACKEND ]]; then overrides[$key]=${!key}; fi
+        if [[ -v $key && $key != FIREWALL_BACKEND && $key != SERVER_IP ]]; then overrides[$key]=${!key}; fi
     done
+    if [[ -n ${VPN_PUBLIC_IP:-} ]]; then overrides[SERVER_IP]=$VPN_PUBLIC_IP; fi
     for arg in "$@"; do
         case $arg in
             --reconfigure) RECONFIGURE=1 ;;
@@ -1194,12 +1266,19 @@ main() {
         for key in VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT; do unset "$key"; done
         for key in "${!overrides[@]}"; do printf -v "$key" '%s' "${overrides[$key]}"; done
     fi
-    if [[ ! -f $CONFIG_FILE ]] || (( RECONFIGURE )); then ask_settings; fi
+    if [[ ! -f $CONFIG_FILE ]] || (( RECONFIGURE )); then
+        ask_settings
+        settings_changed=1
+    fi
     STEP=校验网络与配置
     validate_values
     detect_egress
     validate_network
     if [[ $L2TP_PORT != "${OLD_PORT:-}" ]] && port_busy "$L2TP_PORT"; then die '指定的 L2TP 端口已被占用。'; fi
+    if (( settings_changed )) && [[ -t 0 && ${NONINTERACTIVE:-0} != 1 ]] && ! confirm_settings; then
+        log '已取消，未应用 VPN 配置。'
+        return
+    fi
     render_configs "$WORK_DIR/render"
     STEP=备份与安装配置
     backup_files
