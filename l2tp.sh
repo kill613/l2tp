@@ -837,7 +837,7 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStartPre=$IPSEC_BIN --checknss
-ExecStart=$LIBRESWAN_PREFIX/libexec/ipsec/pluto --config /etc/ipsec.conf --nofork
+ExecStart=$LIBRESWAN_PREFIX/libexec/ipsec/pluto --config /etc/ipsec.conf --nofork --stderrlog
 Restart=on-failure
 RestartSec=5
 [Install]

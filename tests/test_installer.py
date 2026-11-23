@@ -130,6 +130,9 @@ apply_forwarding
         self.shell('render_configs "$WORK_DIR/render"')
         self.assertIn("aes128-sha2_256;modp3072", (self.work / "render/ipsec.conf").read_text())
 
+    def test_service_keeps_runtime_logs_in_journal(self):
+        self.assertIn("ExecStart=$LIBRESWAN_PREFIX/libexec/ipsec/pluto --config /etc/ipsec.conf --nofork --stderrlog", SCRIPT)
+
     def test_random_credentials(self):
         result = self.shell('for n in {1..100}; do random_secret 18; echo; random_secret 32; echo; done')
         values = result.stdout.splitlines()
