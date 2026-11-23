@@ -719,6 +719,7 @@ conn l2tp-ikuai
     type=transport
     left=%defaultroute
     leftprotoport=17/$L2TP_PORT
+    leftupdown=$LIBRESWAN_PREFIX/libexec/ipsec/_updown
     right=%any
     rightprotoport=17/%any
     dpddelay=40

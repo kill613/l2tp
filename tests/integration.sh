@@ -127,6 +127,7 @@ conn zero-test
     salifetime=1h
     auto=add
 EOF
+printf '    leftupdown=%s/libexec/ipsec/_updown\n' "$LIBRESWAN_PREFIX" >> "$WORK_DIR/zero.conf"
 printf '%%any %%any : PSK "ZeroLifetimeTest123"\n' > "$WORK_DIR/zero.secrets"
 "$LIBRESWAN_PREFIX/libexec/ipsec/pluto" --nofork --stderrlog \
     --config "$WORK_DIR/zero.conf" --secretsfile "$WORK_DIR/zero.secrets" \
