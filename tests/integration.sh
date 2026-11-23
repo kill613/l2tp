@@ -142,4 +142,3 @@ grep -E '(ISAKMP|IKE) SA established' "$WORK_DIR/zero-status"
 grep -F 'zero IKE lifetime normalized' "$WORK_DIR/pluto.log"
 if grep -F 'IKE SA expired' "$WORK_DIR/pluto.log"; then exit 1; fi
 echo 'PASS zero-lifetime IKE SA survives authentication'
-
