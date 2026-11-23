@@ -48,10 +48,19 @@ jobs:
           docker run --rm --privileged -v "$PWD:/repo:ro" -w /repo "debian:$SUITE" bash -Eeuo pipefail -c '
             source ./l2tp.sh
             source /etc/os-release
-            select_distribution "$ID" "$VERSION_ID"
+            # Exercise preflight in the container with its PID 1 check represented by this directory.
+            mkdir -p /run/systemd/system /run/lock
+            preflight
             WORK_DIR=$(mktemp -d)
             trap '\''rm -rf -- "$WORK_DIR"'\'' EXIT
             chmod 711 "$WORK_DIR"
+            if [[ $CODENAME == trixie ]]; then
+              command -v sqv
+              probe_mirror http://deb.debian.org/debian || {
+                sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output "$WORK_DIR/probe.diagnostic" "$WORK_DIR/probe"
+                exit 1
+              }
+            fi
             apt_options
             create_package_policy
             try_mirror http://deb.debian.org/debian http://deb.debian.org/debian-security

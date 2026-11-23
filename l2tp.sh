@@ -211,7 +211,7 @@ preflight() {
     [[ -d /run/systemd/system ]] || die '需要运行 systemd 的完整 Debian 或 Ubuntu 系统。'
     [[ -f ${BASH_SOURCE[0]} ]] || die '请先下载脚本到文件后再运行。'
     local command_name
-    for command_name in flock timeout gpgv sysctl; do command -v "$command_name" >/dev/null || die "缺少基础命令 $command_name。"; done
+    for command_name in flock timeout; do command -v "$command_name" >/dev/null || die "缺少基础命令 $command_name。"; done
     [[ -x /usr/lib/apt/apt-helper && -r $ARCHIVE_KEYRING ]] || die '缺少 APT 下载组件或发行版签名密钥。'
     exec 9>/run/lock/l2tp-installer.lock
     flock -n 9 || die '另一安装进程正在运行。'
@@ -324,7 +324,7 @@ try_mirror() {
         chmod 755 "$WORK_DIR/lists" "$WORK_DIR/lists/partial" || return 1
         if timeout 300 apt-get "${APT_OPTS[@]}" update &&
             DEBIAN_FRONTEND=noninteractive timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-remove --no-install-recommends \
-                libreswan xl2tpd ppp iproute2 iptables python3 curl ca-certificates; then
+                libreswan xl2tpd ppp iproute2 iptables procps python3 curl ca-certificates; then
             return 0
         fi
         if ((attempt < 3)); then sleep "$((attempt * 2))"; fi
@@ -367,7 +367,7 @@ install_packages() {
             log "镜像暂不可用：$base；保留为后续重试候选。"
             printf '999999 %s\n' "$idx" >> "$WORK_DIR/ranking"
         fi
-        rm -f -- "$WORK_DIR/probe"
+        rm -f -- "$WORK_DIR/probe" "$WORK_DIR/probe.clear"
     done
     apt_options
     while read -r _elapsed idx; do
@@ -378,9 +378,17 @@ install_packages() {
 }
 
 probe_mirror() {
-    timeout 20 /usr/lib/apt/apt-helper -o Acquire::Retries=0 -o Acquire::https::Timeout=8 \
+    local -a verifier
+    if command -v sqv >/dev/null; then
+        verifier=(sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output "$WORK_DIR/probe.clear")
+    elif command -v gpgv >/dev/null; then
+        verifier=(gpgv --keyring "$ARCHIVE_KEYRING")
+    else
+        return 1
+    fi
+    timeout 20 /usr/lib/apt/apt-helper -o Acquire::Retries=0 -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
         download-file "$1/dists/$CODENAME/InRelease" "$WORK_DIR/probe" >/dev/null 2>&1 &&
-        gpgv --keyring "$ARCHIVE_KEYRING" "$WORK_DIR/probe" >/dev/null 2>&1
+        "${verifier[@]}" "$WORK_DIR/probe" >/dev/null 2>&1
 }
 
 create_package_policy() {

@@ -321,6 +321,26 @@ install_packages
 ''' + f'[[ $(tail -n1 "$WORK_DIR/mirrors") == {expected}* ]]')
                 (self.work / "mirrors").unlink()
 
+    def test_mirror_probe_with_sqv_and_without_gpgv(self):
+        self.shell(r'''
+select_distribution debian 13
+command() { [[ $1 == -v && $2 == sqv ]]; }
+timeout() {
+    [[ $* == *"/dists/trixie/InRelease"* ]] || return 1
+    printf signed > "$WORK_DIR/probe"
+}
+sqv() {
+    [[ $# == 6 && $1 == --keyring && $2 == "$ARCHIVE_KEYRING" &&
+       $3 == --cleartext && $4 == --output && $5 == "$WORK_DIR/probe.clear" && $(cat "$6") == signed ]]
+}
+probe_mirror https://example.invalid/debian
+sqv() { return 1; }
+if probe_mirror https://example.invalid/debian; then exit 1; fi
+command() { return 1; }
+timeout() { exit 2; }
+if probe_mirror https://example.invalid/debian; then exit 1; fi
+''')
+
     def test_debian_archive_and_security_sources(self):
         for version, codename in (("12", "bookworm"), ("13", "trixie")):
             with self.subTest(version=version):
