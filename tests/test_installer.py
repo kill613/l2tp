@@ -203,6 +203,19 @@ detect_backend
             for pattern in (r"[A-Z]", r"[a-z]", r"[0-9]"):
                 self.assertRegex(value, pattern)
 
+    def test_interactive_summary_hides_secrets_and_requires_confirmation(self):
+        code = r'''
+SERVER_IP=8.8.4.4
+confirm_settings <<< ANSWER
+'''
+        result = self.shell(code.replace("ANSWER", "y"))
+        for value in ("8.8.4.4", "real", "18562", "500、4500", "192.168.18.1",
+                      "192.168.18.10-192.168.18.250", "223.5.5.5、1.1.1.1"):
+            self.assertIn(value, result.stdout)
+        self.assertNotIn("Abcdefghijk12345678", result.stdout)
+        self.assertNotIn("Abcdefghijklmnopqrstuvwxyz1234567", result.stdout)
+        self.shell(code.replace("ANSWER", "''"), ok=False)
+
     def test_empty_defaults_and_psk(self):
         self.shell(r'''
 unset VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT
