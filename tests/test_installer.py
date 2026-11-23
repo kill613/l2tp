@@ -46,6 +46,7 @@ class InstallerTests(unittest.TestCase):
 source ./l2tp.sh
 ask_server_ip() { :; }
 compile_install() { :; }
+relay_firewall() { :; }
 IPSEC_BIN=/usr/sbin/ipsec
 WORK_DIR=$TEST_TMP
 if command -v cygpath >/dev/null; then
@@ -129,6 +130,54 @@ apply_forwarding
     def test_ikuai_dh15_proposal_is_available(self):
         self.shell('render_configs "$WORK_DIR/render"')
         self.assertIn("aes128-sha2_256;modp3072", (self.work / "render/ipsec.conf").read_text())
+
+    def test_relay_table_is_supported_but_other_native_tables_are_rejected(self):
+        self.shell(r'''
+systemctl() { return 1; }
+ufw() { echo 'Status: inactive'; }
+nft() { echo 'table ip filter'; echo 'table ip nat'; echo 'table inet sbm_relay'; }
+detect_backend
+[[ $FIREWALL_BACKEND == iptables ]]
+''')
+        self.shell(r'''
+systemctl() { return 1; }
+nft() { echo 'table inet other-firewall'; }
+detect_backend
+''', ok=False)
+
+    def test_relay_rules_preserve_foreign_state_and_reject_unknown_owners(self):
+        snapshot = {"nftables": [
+            {"chain": {"name": "input", "hook": "input", "policy": "drop"}},
+            {"chain": {"name": "forward", "hook": "forward", "policy": "drop"}},
+            {"set": {"name": "hy2_ports", "elem": [21000]}},
+            {"rule": {"chain": "input", "handle": 7, "expr": [{"jump": {"target": "ssh_access"}}]}},
+        ]}
+        file = self.work / "relay.json"
+        file.write_text(json.dumps(snapshot))
+        result = self.run_python("render_relay_rules", [file, "apply", 24566, "192.168.18.0/24", "eth0"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("meta secpath exists counter accept", result.stdout)
+        self.assertIn('iifname "ppp*" oifname "eth0" ip saddr 192.168.18.0/24', result.stdout)
+        for foreign in ("ssh_access", "hy2_ports", "delete table", "policy drop", "flush ruleset"):
+            self.assertNotIn(foreign, result.stdout)
+        snapshot["nftables"].extend([
+            {"chain": {"name": "l2tp_installer_input"}},
+            {"rule": {"chain": "l2tp_installer_input", "handle": 9, "expr": [{"accept": None}]}},
+        ])
+        file.write_text(json.dumps(snapshot))
+        result = self.run_python("render_relay_rules", [file, "apply", 24566, "192.168.18.0/24", "eth0"])
+        self.assertNotEqual(result.returncode, 0)
+        snapshot["nftables"][-1]["rule"]["comment"] = "l2tp-installer-coexist"
+        snapshot["nftables"].append({"rule": {
+            "chain": "input", "handle": 42, "comment": "l2tp-installer-coexist",
+            "expr": [{"jump": {"target": "l2tp_installer_input"}}],
+        }})
+        file.write_text(json.dumps(snapshot))
+        result = self.run_python("render_relay_rules", [file, "remove", 24566, "192.168.18.0/24", "eth0"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("delete rule inet sbm_relay input handle 42", result.stdout)
+        self.assertIn("delete chain inet sbm_relay l2tp_installer_input", result.stdout)
+        self.assertNotIn("handle 7", result.stdout)
 
     def test_random_credentials(self):
         result = self.shell('for n in {1..100}; do random_secret 18; echo; random_secret 32; echo; done')

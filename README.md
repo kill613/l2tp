@@ -70,7 +70,7 @@ sudo env NONINTERACTIVE=1 bash l2tp.sh --reconfigure
 
 旧版仅自动导入可明确识别的原仓库单账户配置，保留账户、密码与端口，修正地址池格式，**更换旧 PSK 为随机新值**。其他 VPN、多账户或无法识别的配置不会被覆盖。
 
-如果检测到旧脚本安装在 `/usr/local` 下的源码版 Libreswan，安装器会停止：需要先备份并按原安装记录卸载源码版，再安装系统软件包，避免两个 IPsec 实现争用配置和端口。检测到 strongSwan、firewalld、启用的 nftables 服务或额外原生 nftables 表时也会停止，不自动替换其他服务。
+如果检测到旧脚本安装在 `/usr/local` 下的源码版 Libreswan，安装器会停止：需要先备份并按原安装记录卸载源码版，再安装系统软件包，避免两个 IPsec 实现争用配置和端口。检测到 strongSwan、firewalld、启用的 nftables 服务或尚未支持的原生 nftables 表时也会停止，不自动替换其他服务。
 
 秋水逸冰原版固定使用 Libreswan 3.27。本二次开发版选择 4.15，并对已抓包确认的爱快零秒 IKE 寿命加入兼容处理。编译源码中的零寿命在 IKE 与 IPsec 两阶段使用本地配置的正寿命，协商回复同步携带该值，并保留认证所需的原始提议。非零寿命保持上游处理。该修改在脚本中明确标注，属于本仓库补丁。运行文件位于 `/opt/l2tp-libreswan/4.15-ikuai2`，配置和旧服务单元在切换前备份。系统安装的原有 Libreswan 软件包保留供回退。首次编译需要数分钟。
 
@@ -133,3 +133,11 @@ python3 -m unittest discover -s tests -v
 寿命兼容 v2 的测试覆盖两个阶段的零寿命、协商回复、双方认证及 IPsec SA 存活，同时检查非零寿命保持不变。
 
 独立编译核心的 leftupdown 显式指向同一安装目录，避免与发行版旧辅助脚本混用。
+
+## 与 SingBox 中转共存
+
+检测到 inet sbm_relay 时，在该表创建带归属注释的 l2tp_installer_input 和 l2tp_installer_forward 两条普通链，分别从现有 input/forward 基链跳转。规则仅允许 IPv4 IPsec 的 UDP 500/4500、ESP、经 IPsec 保护的 L2TP 端口，以及指定 VPN 地址池从 ppp 接口到实际出口的转发和已建立连接回包。
+
+保留中转表的 DROP 策略、SSH、WireGuard、Agent 与 HY2 端口集。在修改前备份表与相关配置，规则用 nft --check 预检并按事务应用。安装器维护 sbm-relay-firewall.service 的专用 ExecStartPost 配置，在中转服务重新建立自己的防火墙表后重建 L2TP 共存规则。安装该配置只重载 systemd 单元，不主动重启中转服务。
+
+其他原生 nftables 表继续要求单独核对。仅在另一张表中添加 ACCEPT，无法覆盖 sbm_relay 基链的默认 DROP。
