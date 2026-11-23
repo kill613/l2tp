@@ -141,3 +141,5 @@ python3 -m unittest discover -s tests -v
 保留中转表的 DROP 策略、SSH、WireGuard、Agent 与 HY2 端口集。在修改前备份表与相关配置，规则用 nft --check 预检并按事务应用。安装器维护 sbm-relay-firewall.service 的专用 ExecStartPost 配置，在中转服务重新建立自己的防火墙表后重建 L2TP 共存规则。安装该配置只重载 systemd 单元，不主动重启中转服务。
 
 其他原生 nftables 表继续要求单独核对。仅在另一张表中添加 ACCEPT，无法覆盖 sbm_relay 基链的默认 DROP。
+
+可与 SK5、中转同机部署。选择 L2TP 端口时会额外读取本项目 SK5 的私有配置，跳过整个 UDP 中继保留范围，即使某个端口当时尚未绑定；手动选择该范围内端口也会按冲突处理。中转最后安装时，请使用支持三服务共存的 SingBox Manager 4.0.4 或更新版本生成节点包。重复运行 L2TP 安装保留现有配置，不会修改 SK5 或中转身份。
