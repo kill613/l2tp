@@ -121,6 +121,7 @@ conn zero-test
     rightprotoport=17/%any
     ike=aes128-sha2_256;modp3072
     esp=aes128-sha2_256
+    pfs=no
     rekey=no
     ikelifetime=8h
     salifetime=1h
