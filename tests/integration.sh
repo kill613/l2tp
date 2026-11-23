@@ -121,10 +121,13 @@ conn zero-test
     rightprotoport=17/%any
     ike=aes128-sha2_256;modp3072
     esp=aes128-sha2_256
+    pfs=no
     rekey=no
     ikelifetime=8h
+    salifetime=1h
     auto=add
 EOF
+printf '    leftupdown=%s/libexec/ipsec/_updown\n' "$LIBRESWAN_PREFIX" >> "$WORK_DIR/zero.conf"
 printf '%%any %%any : PSK "ZeroLifetimeTest123"\n' > "$WORK_DIR/zero.secrets"
 "$LIBRESWAN_PREFIX/libexec/ipsec/pluto" --nofork --stderrlog \
     --config "$WORK_DIR/zero.conf" --secretsfile "$WORK_DIR/zero.secrets" \
@@ -139,6 +142,10 @@ ip netns exec "$client_ns" python3 tests/ike_zero_lifetime.py 198.19.0.1 198.19.
 sleep 3
 "$LIBRESWAN_PREFIX/libexec/ipsec/whack" --ctlsocket "$WORK_DIR/pluto/pluto.ctl" --status > "$WORK_DIR/zero-status"
 grep -E '(ISAKMP|IKE) SA established' "$WORK_DIR/zero-status"
+grep -F 'IPsec SA established' "$WORK_DIR/zero-status"
 grep -F 'zero IKE lifetime normalized' "$WORK_DIR/pluto.log"
 if grep -F 'IKE SA expired' "$WORK_DIR/pluto.log"; then exit 1; fi
 echo 'PASS zero-lifetime IKE SA survives authentication'
+
+# Nonzero lifetimes must retain their original negotiated value.
+ip netns exec "$client_ns" python3 tests/ike_zero_lifetime.py 198.19.0.1 198.19.0.2 ZeroLifetimeTest123 120
