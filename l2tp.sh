@@ -200,6 +200,9 @@ PY
 
 ask_server_ip() {
     local answer url
+    if [[ -n $SERVER_IP ]] && ! valid_public_ip "$SERVER_IP"; then
+        die '公网 IPv4 无效，请检查 VPN_PUBLIC_IP。'
+    fi
     if [[ -z $SERVER_IP ]]; then
         for url in https://api.ipify.org https://ipv4.icanhazip.com; do
             answer=$(curl -4fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null || true)
@@ -245,6 +248,16 @@ ask_settings() {
     VPN_CIDR=${VPN_CIDR:-192.168.18.0/24}
     VPN_IP_RANGE=${VPN_IP_RANGE:-192.168.18.10-192.168.18.250}
     validate_values
+}
+
+confirm_settings() {
+    local answer
+    printf '\n===== 爱快 L2TP/IPsec 安装确认 =====\n'
+    printf '公网 IPv4：%s\n' "${SERVER_IP:-未检测到，拨号时填写服务器公网地址}"
+    printf '账户：%s\n密码：已设置（安装完成后显示）\nIPsec 预共享密钥（PSK）：已设置（安装完成后显示）\n' "$VPN_USER"
+    printf 'L2TP 端口：UDP %s\nIPsec 端口：UDP 500、4500\n' "$L2TP_PORT"
+    printf 'VPN 网关：%s\n客户端地址池：%s\nDNS：223.5.5.5、1.1.1.1\n\n' "$VPN_LOCAL_IP" "$VPN_IP_RANGE"
+    read -r -p '应用以上配置？[y/N]：' answer && [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]
 }
 
 detect_backend() {
@@ -1088,6 +1101,7 @@ show_result() {
     printf '服务器地址/域名：%s\n服务端口：%s（UDP）\n用户名：%s\n密码：%s\n预共享密钥：%s\n' \
         "${public_ip:-请填写服务器可达的公网 IP 或域名}" "$L2TP_PORT" "$VPN_USER" "$VPN_PASS" "$IPSEC_PSK"
     printf '本地标识/对方标识：留空\nMTU/MRU：1400\n'
+    printf 'VPN 网关：%s\n客户端地址池：%s\nDNS：223.5.5.5、1.1.1.1\n' "$VPN_LOCAL_IP" "$VPN_IP_RANGE"
     printf '云安全组/上游映射：UDP 500、4500；L2TP 数据使用端口 %s，服务器仅接受 IPsec 保护的数据。\n' "$L2TP_PORT"
     printf '已配置本机防火墙；未修改云安全组。IPsec 封装下，上游通常只需放行 UDP 500/4500。\n'
     printf '配置：%s（权限 600）\n备份：%s\n' "$CONFIG_FILE" "$BACKUP_DIR"
@@ -1124,12 +1138,13 @@ diagnose() {
 }
 
 main() {
-    local mode=install arg key
+    local mode=install arg key settings_changed=0
     # Preserve explicit environment overrides separately from stored state.
     declare -A overrides=()
     for key in "${KEYS[@]}"; do
-        if [[ -v $key && $key != FIREWALL_BACKEND ]]; then overrides[$key]=${!key}; fi
+        if [[ -v $key && $key != FIREWALL_BACKEND && $key != SERVER_IP ]]; then overrides[$key]=${!key}; fi
     done
+    if [[ -n ${VPN_PUBLIC_IP:-} ]]; then overrides[SERVER_IP]=$VPN_PUBLIC_IP; fi
     for arg in "$@"; do
         case $arg in
             --reconfigure) RECONFIGURE=1 ;;
@@ -1194,12 +1209,19 @@ main() {
         for key in VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT; do unset "$key"; done
         for key in "${!overrides[@]}"; do printf -v "$key" '%s' "${overrides[$key]}"; done
     fi
-    if [[ ! -f $CONFIG_FILE ]] || (( RECONFIGURE )); then ask_settings; fi
+    if [[ ! -f $CONFIG_FILE ]] || (( RECONFIGURE )); then
+        ask_settings
+        settings_changed=1
+    fi
     STEP=校验网络与配置
     validate_values
     detect_egress
     validate_network
     if [[ $L2TP_PORT != "${OLD_PORT:-}" ]] && port_busy "$L2TP_PORT"; then die '指定的 L2TP 端口已被占用。'; fi
+    if (( settings_changed )) && [[ -t 0 && ${NONINTERACTIVE:-0} != 1 ]] && ! confirm_settings; then
+        log '已取消，未应用 VPN 配置。'
+        return
+    fi
     render_configs "$WORK_DIR/render"
     STEP=备份与安装配置
     backup_files
