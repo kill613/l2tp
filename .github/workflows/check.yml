@@ -31,3 +31,48 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Actual component and firewall checks in isolated network
         run: sudo bash tests/integration.sh
+
+  debian:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [bookworm, trixie]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install dependencies and exercise the iKuai compatibility core on Debian
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          sudo modprobe dummy
+          docker run --rm --privileged -v "$PWD:/repo:ro" -w /repo "debian:$SUITE" bash -Eeuo pipefail -c '
+            source ./l2tp.sh
+            source /etc/os-release
+            select_distribution "$ID" "$VERSION_ID"
+            WORK_DIR=$(mktemp -d)
+            trap '\''rm -rf -- "$WORK_DIR"'\'' EXIT
+            chmod 711 "$WORK_DIR"
+            if [[ $CODENAME == trixie ]]; then
+              command -v sqv
+              probe_mirror http://deb.debian.org/debian
+            fi
+            apt_options
+            create_package_policy
+            try_mirror http://deb.debian.org/debian http://deb.debian.org/debian-security
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends shellcheck nftables ufw systemd python3-cryptography
+            finish_package_install
+            mkdir -p /run/systemd/system /run/lock
+            preflight
+            compile_install
+            ensure_xl2tpd_unit
+            systemd-analyze --man=no verify xl2tpd.service
+            systemctl --root=/ enable xl2tpd.service
+            bash -n l2tp.sh
+            bash -n tests/integration.sh
+            shellcheck -x l2tp.sh tests/integration.sh
+            PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+            bash tests/integration.sh
+          '
