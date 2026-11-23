@@ -380,7 +380,7 @@ install_packages() {
 probe_mirror() {
     local -a verifier
     if command -v sqv >/dev/null; then
-        verifier=(sqv --keyring "$ARCHIVE_KEYRING" --cleartext)
+        verifier=(sqv --keyring "$ARCHIVE_KEYRING" --cleartext --output -)
     elif command -v gpgv >/dev/null; then
         verifier=(gpgv --keyring "$ARCHIVE_KEYRING")
     else
