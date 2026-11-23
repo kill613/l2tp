@@ -42,6 +42,9 @@ cleanup() {
         log "失败步骤：$STEP（退出码 $rc）。未宣告安装成功。"
         if (( CHANGED && ! COMMITTED )) && [[ -n $BACKUP_DIR ]]; then
             log "正在恢复修改前的配置：$BACKUP_DIR"
+            if [[ -n ${EGRESS_IF:-} && -n ${L2TP_PORT:-} && -n ${VPN_CIDR:-} ]]; then
+                relay_firewall remove || log 'L2TP 共存规则回收失败，请检查专用链。'
+            fi
             while IFS= read -r path; do
                 if [[ -e $BACKUP_DIR/files$path ]]; then
                     cp -a -- "$BACKUP_DIR/files$path" "$path" || log "恢复失败：$path"
@@ -224,9 +227,9 @@ detect_backend() {
     fi
     if command -v nft >/dev/null; then
         rules=$(nft list tables) || die '无法检查 nftables。'
-        # iptables-nft compatibility tables are supported; native tables are not.
-        if [[ -n $(printf '%s\n' "$rules" | grep -Ev '^table ip6? (filter|nat|mangle|raw|security)$|^$' || true) ]]; then
-            die '检测到原生 nftables 表，请先明确规则管理方式，避免多套防火墙冲突。'
+        # Support the known SingBox relay table through dedicated coexistence chains.
+        if [[ -n $(printf '%s\n' "$rules" | grep -Ev '^table ip6? (filter|nat|mangle|raw|security)$|^table inet sbm_relay$|^$' || true) ]]; then
+            die '检测到尚未支持的原生 nftables 表，请核对规则管理方式。'
         fi
     fi
     if systemctl is-enabled --quiet nftables 2>/dev/null || systemctl is-active --quiet nftables; then
@@ -516,7 +519,7 @@ backup_files() {
     mkdir -p "$BACKUP_DIR/files"
     chmod 700 "$CONFIG_DIR" "$CONFIG_DIR/backups" "$BACKUP_DIR"
     local path unit enabled active key
-    for path in /etc/l2tp-deploy/client.txt /usr/local/libexec/l2tp-network /etc/systemd/system/l2tp-network.service \
+    for path in /etc/systemd/system/sbm-relay-firewall.service.d/90-l2tp-coexist.conf /etc/l2tp-deploy/client.txt /usr/local/libexec/l2tp-network /etc/systemd/system/l2tp-network.service \
         /etc/systemd/system/ipsec.service.d/80-l2tp-network.conf /etc/systemd/system/xl2tpd.service.d/80-l2tp-network.conf "$CONFIG_FILE" "$RUNTIME" /etc/ipsec.conf /etc/ipsec.secrets /etc/xl2tpd/xl2tpd.conf \
         /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets /etc/ufw/before.rules \
         /usr/local/sbin/ipsec /etc/systemd/system/ipsec.service /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
@@ -536,6 +539,9 @@ backup_files() {
         printf '%s %s\n' "$key" "$(sysctl -n "$key")" >> "$BACKUP_DIR/sysctl"
     done
     iptables-save > "$BACKUP_DIR/iptables.v4"
+    if command -v nft >/dev/null && nft list table inet sbm_relay >/dev/null 2>&1; then
+        nft -a list table inet sbm_relay > "$BACKUP_DIR/sbm-relay-before.nft"
+    fi
     CHANGED=1
 }
 
@@ -877,6 +883,82 @@ pathlib.Path(dst).write_text(text)
 PY
 }
 
+render_relay_rules() {
+    python3 - "$1" "$2" "$L2TP_PORT" "$VPN_CIDR" "$EGRESS_IF" <<'PY'
+import ipaddress
+import json
+from pathlib import Path
+import re
+import sys
+
+snapshot, action, port, cidr, iface = sys.argv[1:]
+port = int(port)
+network = ipaddress.IPv4Network(cidr)
+if not 1 <= port <= 65535 or not re.fullmatch(r'[A-Za-z0-9_.:-]+', iface):
+    sys.exit("Invalid coexistence settings")
+items = json.loads(Path(snapshot).read_text())["nftables"]
+chains = {item["chain"]["name"]: item["chain"] for item in items if "chain" in item}
+rules = [item["rule"] for item in items if "rule" in item]
+for name, hook in (("input", "input"), ("forward", "forward")):
+    if chains.get(name, {}).get("hook") != hook:
+        sys.exit("sbm_relay base chains do not match the known relay firewall")
+owned = {"input": "l2tp_installer_input", "forward": "l2tp_installer_forward"}
+tag = "l2tp-installer-coexist"
+commands = []
+for parent, child in owned.items():
+    if child in chains and "hook" in chains[child]:
+        sys.exit("Coexistence chain name conflicts with a base chain")
+    for rule in rules:
+        targets = [expr["jump"]["target"] for expr in rule.get("expr", []) if "jump" in expr]
+        if rule["chain"] == child and rule.get("comment") != tag:
+            sys.exit("Coexistence chain contains rules owned by another application")
+        if child in targets:
+            if rule["chain"] != parent or rule.get("comment") != tag:
+                sys.exit("Coexistence chain has an unrecognized reference")
+            commands.append(f'delete rule inet sbm_relay {parent} handle {int(rule["handle"])}')
+    if child in chains:
+        commands.append(f'flush chain inet sbm_relay {child}')
+        if action == "remove":
+            commands.append(f'delete chain inet sbm_relay {child}')
+    elif action == "apply":
+        commands.append(f'add chain inet sbm_relay {child}')
+if action == "apply":
+    incoming = [
+        'meta nfproto ipv4 udp dport { 500, 4500 } counter accept',
+        'meta nfproto ipv4 meta l4proto esp counter accept',
+        f'meta nfproto ipv4 udp dport {port} meta secpath exists counter accept',
+    ]
+    forwarding = [
+        f'iifname "ppp*" oifname "{iface}" ip saddr {network} counter accept',
+        f'iifname "{iface}" oifname "ppp*" ip daddr {network} ct state established,related counter accept',
+    ]
+    for rule in incoming:
+        commands.append(f'add rule inet sbm_relay {owned["input"]} {rule} comment "{tag}"')
+    for rule in forwarding:
+        commands.append(f'add rule inet sbm_relay {owned["forward"]} {rule} comment "{tag}"')
+    for parent, child in owned.items():
+        commands.append(f'add rule inet sbm_relay {parent} jump {child} comment "{tag}"')
+elif action != "remove":
+    sys.exit("Unknown coexistence operation")
+print("\n".join(commands))
+
+PY
+}
+
+relay_firewall() {
+    local action=$1 tables
+    command -v nft >/dev/null || return 0
+    tables=$(nft list tables) || die '无法读取中转防火墙。'
+    grep -qx 'table inet sbm_relay' <<< "$tables" || return 0
+    [[ -n $WORK_DIR ]] || WORK_DIR=$(mktemp -d /tmp/l2tp-installer.XXXXXXXX)
+    nft -j list table inet sbm_relay > "$WORK_DIR/relay.json"
+    render_relay_rules "$WORK_DIR/relay.json" "$action" > "$WORK_DIR/relay.nft"
+    if [[ -s $WORK_DIR/relay.nft ]]; then
+        nft --check -f "$WORK_DIR/relay.nft"
+        nft -f "$WORK_DIR/relay.nft"
+    fi
+}
+
 apply_forwarding() {
     sysctl -w net.ipv4.ip_forward=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 >/dev/null
     [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]] || die 'IPv4 转发未生效，请检查系统限制。'
@@ -894,6 +976,7 @@ apply_firewall() {
     else
         apply_iptables
     fi
+    relay_firewall apply
     apply_forwarding
 }
 
@@ -903,7 +986,7 @@ install_services() {
 [Unit]
 Description=L2TP/IPsec forwarding and firewall rules
 Wants=network-online.target
-After=network-online.target ufw.service netfilter-persistent.service
+After=network-online.target ufw.service netfilter-persistent.service sbm-relay-firewall.service
 Before=ipsec.service xl2tpd.service
 
 [Service]
@@ -942,6 +1025,16 @@ Restart=on-failure
 RestartSec=5s
 EOF
     done
+    if command -v nft >/dev/null && nft list table inet sbm_relay >/dev/null 2>&1; then
+        install -d -m 755 /etc/systemd/system/sbm-relay-firewall.service.d
+        cat > /etc/systemd/system/sbm-relay-firewall.service.d/90-l2tp-coexist.conf <<EOF
+[Unit]
+Wants=network-online.target
+After=network-online.target
+[Service]
+ExecStartPost=$RUNTIME --apply-firewall
+EOF
+    fi
     install -d -m 755 /usr/local/sbin
     ln -sfn "$IPSEC_BIN" /usr/local/sbin/ipsec
     systemctl daemon-reload
@@ -992,7 +1085,10 @@ diagnose() {
     iptables -nvx -L L2TP-IN || true
     iptables -nvx -L L2TP-FWD || true
     iptables -t nat -nvx -L L2TP-NAT || true
-    if command -v nft >/dev/null; then nft list tables || true; fi
+    if command -v nft >/dev/null; then
+        nft list tables || true
+        nft -a list table inet sbm_relay || true
+    fi
     printf '\n===== 协商与数据策略 =====\n'
     ipsec auto --status || true
     ip -s xfrm policy || true

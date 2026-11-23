@@ -35,6 +35,25 @@ ipsec addconn --config "$WORK_DIR/render/ipsec.conf" --checkconfig
 ip link set lo up
 ip link add ens3 type dummy
 ip link set ens3 up
+create_relay_table() {
+    nft -f - <<'EOF_RELAY'
+table inet sbm_relay {
+    set hy2_ports { type inet_service; elements = { 21000 }; }
+    chain ssh_access { tcp dport 57218 counter accept; }
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        udp dport 51820 accept
+        udp dport @hy2_ports accept
+        jump ssh_access
+    }
+    chain forward { type filter hook forward priority 0; policy drop; }
+    chain output { type filter hook output priority 0; policy accept; }
+}
+EOF_RELAY
+}
+create_relay_table
 iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 iptables -A INPUT -j DROP
 iptables -t nat -A POSTROUTING -s 10.73.0.0/24 -j MASQUERADE
@@ -92,6 +111,23 @@ iptables -C L2TP-IN -p udp --dport 18563 -j DROP
 iptables -C ufw-user-input -p tcp --dport 22 -j ACCEPT
 [[ $(iptables -S ufw-before-input | grep -c -- '-j L2TP-IN') == 1 ]]
 [[ $(iptables -S L2TP-IN | grep -c -- '^-A ') == 4 ]]
+# Real host has both iptables-nft and a relay inet table with default DROP.
+relay_firewall apply
+nft -s list table inet sbm_relay > "$WORK_DIR/relay-once"
+relay_firewall apply
+nft -s list table inet sbm_relay > "$WORK_DIR/relay-twice"
+cmp "$WORK_DIR/relay-once" "$WORK_DIR/relay-twice"
+nft list set inet sbm_relay hy2_ports | grep '21000'
+nft list chain inet sbm_relay ssh_access | grep '57218'
+nft list chain inet sbm_relay forward | grep 'policy drop'
+relay_firewall remove
+nft list chain inet sbm_relay ssh_access | grep '57218'
+if nft list chain inet sbm_relay l2tp_installer_input; then exit 1; fi
+relay_firewall apply
+# Model the relay service recreating its owned table, then ExecStartPost.
+nft delete table inet sbm_relay
+create_relay_table
+relay_firewall apply
 echo 'IPsec/xl2tpd configuration and isolated iptables/active UFW checks passed.'
 
 # Reproduce the captured iKuai zero-duration IKEv1 PSK offer.
