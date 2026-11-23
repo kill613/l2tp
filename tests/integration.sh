@@ -77,7 +77,9 @@ ip route add default via 198.18.0.254 dev ens3
 ufw allow 22/tcp
 ufw --force enable
 OLD_BACKEND=ufw
+sysctl -w net.ipv4.ip_forward=0
 apply_firewall
+[[ $(sysctl -n net.ipv4.ip_forward) == 1 ]]
 [[ $FIREWALL_BACKEND == ufw ]]
 ufw reload
 iptables -C L2TP-IN -p udp --dport 18563 -m policy --dir in --pol ipsec -j ACCEPT

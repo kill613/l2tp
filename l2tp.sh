@@ -556,7 +556,7 @@ conn l2tp-ikuai
     encapsulation=yes
     pfs=no
     rekey=no
-    ike=aes256-sha2_256;modp2048,aes128-sha2_256;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048
+    ike=aes256-sha2_256;modp2048,aes128-sha2_256;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,aes128-sha2_256;modp3072
     esp=aes256-sha2_256,aes128-sha2_256,aes256-sha1,aes128-sha1
     dpddelay=30
     dpdtimeout=120
@@ -709,6 +709,11 @@ pathlib.Path(dst).write_text(text)
 PY
 }
 
+apply_forwarding() {
+    sysctl -w net.ipv4.ip_forward=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 >/dev/null
+    [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]] || die 'IPv4 转发未生效，请检查系统限制。'
+}
+
 apply_firewall() {
     detect_backend
     detect_egress
@@ -721,6 +726,7 @@ apply_firewall() {
     else
         apply_iptables
     fi
+    apply_forwarding
 }
 
 install_services() {
@@ -784,6 +790,32 @@ show_result() {
     printf '服务检查不代表爱快已经拨号成功；请确认爱快获得本地 IP 并测试上网。\n'
 }
 
+diagnose() {
+    [[ $(id -u) == 0 ]] || die '诊断需要 root。'
+    printf '\n===== 时间及版本 =====\n'
+    date -Is
+    ipsec --version || true
+    printf '\n===== 服务和监听 =====\n'
+    systemctl --no-pager --full status ipsec xl2tpd l2tp-firewall || true
+    ss -lunp || true
+    printf '\n===== 转发和路由 =====\n'
+    sysctl net.ipv4.ip_forward net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter || true
+    ip -4 route get 1.1.1.1 || true
+    ip -4 address show || true
+    printf '\n===== 防火墙规则及计数 =====\n'
+    iptables -S INPUT || true
+    iptables -S FORWARD || true
+    iptables -nvx -L L2TP-IN || true
+    iptables -nvx -L L2TP-FWD || true
+    iptables -t nat -nvx -L L2TP-NAT || true
+    if command -v nft >/dev/null; then nft list tables || true; fi
+    printf '\n===== 协商与数据策略 =====\n'
+    ipsec auto --status || true
+    ip -s xfrm policy || true
+    printf '\n===== 最近拨号日志 =====\n'
+    journalctl -u ipsec -u xl2tpd -u l2tp-firewall --since '5 minutes ago' --no-pager -n 120 || true
+}
+
 main() {
     local mode=install arg key
     # Preserve explicit environment overrides separately from stored state.
@@ -795,12 +827,14 @@ main() {
         case $arg in
             --reconfigure) RECONFIGURE=1 ;;
             --apply-firewall) mode=firewall ;;
+            --diagnose) mode=diagnose ;;
             --help|-h)
-                printf '用法：sudo bash l2tp.sh [--reconfigure]\n环境变量：VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT VPN_PUBLIC_IP VPN_LOCAL_IP VPN_CIDR VPN_IP_RANGE NONINTERACTIVE=1\n重复运行保留原配置；--reconfigure 重新输入账户并生成新的默认密码、PSK 和端口。\n'
+                printf '用法：sudo bash l2tp.sh [--reconfigure|--diagnose]\n环境变量：VPN_USER VPN_PASS IPSEC_PSK L2TP_PORT VPN_PUBLIC_IP VPN_LOCAL_IP VPN_CIDR VPN_IP_RANGE NONINTERACTIVE=1\n重复运行保留原配置；--reconfigure 重新输入账户并生成新的默认密码、PSK 和端口。\n'
                 return ;;
             *) die "未知参数：$arg" ;;
         esac
     done
+    if [[ $mode == diagnose ]]; then diagnose; return; fi
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

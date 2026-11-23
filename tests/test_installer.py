@@ -102,6 +102,32 @@ python3() {
         prefix = "import pathlib\nfiles=" + repr(files) + "\npathlib.Path.read_text=lambda self: files[str(self).replace(chr(92), '/')]\n"
         self.assertNotEqual(self.run_python("import_recent", [target], prefix).returncode, 0)
 
+    def test_firewall_restore_reenables_forwarding(self):
+        self.shell(r'''
+detect_backend() { FIREWALL_BACKEND=iptables; }
+detect_egress() { EGRESS_IF=ens3; }
+apply_iptables() { :; }
+sysctl() {
+    if [[ $1 == -w ]]; then echo 1 > "$WORK_DIR/forward"; else cat "$WORK_DIR/forward"; fi
+}
+echo 0 > "$WORK_DIR/forward"
+apply_firewall
+[[ $(cat "$WORK_DIR/forward") == 1 ]]
+echo 0 > "$WORK_DIR/forward"
+apply_firewall
+[[ $(cat "$WORK_DIR/forward") == 1 ]]
+''')
+
+    def test_forwarding_failure_is_reported(self):
+        self.shell(r'''
+sysctl() { if [[ $1 == -n ]]; then echo 0; fi; }
+apply_forwarding
+''', ok=False)
+
+    def test_ikuai_dh15_proposal_is_available(self):
+        self.shell('render_configs "$WORK_DIR/render"')
+        self.assertIn("aes128-sha2_256;modp3072", (self.work / "render/ipsec.conf").read_text())
+
     def test_random_credentials(self):
         result = self.shell('for n in {1..100}; do random_secret 18; echo; random_secret 32; echo; done')
         values = result.stdout.splitlines()

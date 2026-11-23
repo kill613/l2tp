@@ -106,7 +106,7 @@ sudo env NONINTERACTIVE=1 bash l2tp.sh --reconfigure
 ## 排障与验证
 
 ```bash
-sudo systemctl status ipsec xl2tpd l2tp-firewall --no-pager
+sudo bash l2tp.sh --diagnose\n# 重新拨号后采集，输出不包含配置文件中的密码或 PSK\nsudo systemctl status ipsec xl2tpd l2tp-firewall --no-pager
 sudo journalctl -u ipsec -u xl2tpd -u l2tp-firewall -n 100 --no-pager
 sudo ipsec auto --status
 sudo ss -luntp
@@ -116,7 +116,7 @@ sudo iptables -t nat -S L2TP-NAT
 # UFW 模式请查看 /etc/ufw/before.rules 中的 L2TP-INSTALLER 标记
 ```
 
-若日志显示算法协商不匹配，请提供爱快固件版本和双方日志。默认使用 AES、SHA-256/SHA-1、DH14，不自动启用 DH2 或 3DES。
+若日志显示算法协商不匹配，请提供爱快固件版本和双方日志。默认使用 AES、SHA-256/SHA-1、DH14，并加入已知爱快请求使用的 AES128/SHA-256/DH15 提议，不自动启用 DH2 或 3DES。
 
 仓库验证命令：
 
