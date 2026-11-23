@@ -138,7 +138,7 @@ done
 ip netns exec "$client_ns" python3 tests/ike_zero_lifetime.py 198.19.0.1 198.19.0.2 ZeroLifetimeTest123
 sleep 3
 "$LIBRESWAN_PREFIX/libexec/ipsec/whack" --ctlsocket "$WORK_DIR/pluto/pluto.ctl" --status > "$WORK_DIR/zero-status"
-grep -F 'ISAKMP SA established' "$WORK_DIR/zero-status"
+grep -E '(ISAKMP|IKE) SA established' "$WORK_DIR/zero-status"
 grep -F 'zero IKE lifetime normalized' "$WORK_DIR/pluto.log"
 if grep -F 'IKE SA expired' "$WORK_DIR/pluto.log"; then exit 1; fi
 echo 'PASS zero-lifetime IKE SA survives authentication'
