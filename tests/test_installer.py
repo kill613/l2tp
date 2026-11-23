@@ -86,6 +86,19 @@ python3() {
         for value in ("172.25.122.87", "bad", "224.0.0.1"):
             self.assertNotEqual(self.run_python("valid_public_ip", [value]).returncode, 0)
 
+    @unittest.skipIf(os.name == 'nt', 'Linux root ownership and mode check')
+    def test_sk5_reserved_range_is_busy_even_without_bound_sockets(self):
+        config = self.work / 'settings.json'
+        config.write_text(json.dumps({'schema': 1, 'udp_first': 20000, 'udp_last': 20999}))
+        config.chmod(0o600)
+        prefix = ('import pathlib, types\noriginal_stat=pathlib.Path.lstat\n'
+                  'pathlib.Path.lstat=lambda p: types.SimpleNamespace(st_mode=original_stat(p).st_mode, st_uid=0)\n')
+        for port in (20000, 20555, 20999):
+            self.assertEqual(self.run_python('reserved_sk5_port', [port, config], prefix).returncode, 0)
+        self.assertEqual(self.run_python('reserved_sk5_port', [21000, config], prefix).returncode, 1)
+        config.chmod(0o644)
+        self.assertEqual(self.run_python('reserved_sk5_port', [20555, config], prefix).returncode, 2)
+
     def test_recent_install_import_preserves_credentials(self):
         files = {
             "/etc/ppp/chap-secrets": 'real l2tpd "Password123" *\n',

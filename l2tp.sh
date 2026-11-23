@@ -100,10 +100,37 @@ random_secret() {
 }
 
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
+reserved_sk5_port() {
+    python3 - "$1" "${2:-/etc/sbm-sk5/settings.json}" <<'PY'
+import json
+from pathlib import Path
+import stat
+import sys
+path = Path(sys.argv[2])
+if not path.exists() and not path.is_symlink():
+    sys.exit(1)
+try:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+        raise ValueError()
+    value = json.loads(path.read_text())
+    first, last = value['udp_first'], value['udp_last']
+    if value.get('schema') != 1 or any(type(p) is not int for p in (first, last)) or not 1024 <= first <= last <= 65535:
+        raise ValueError()
+except (OSError, KeyError, TypeError, ValueError):
+    print('Cannot validate the existing SK5 reserved UDP range; no ports changed.', file=sys.stderr)
+    sys.exit(2)
+sys.exit(0 if first <= int(sys.argv[1]) <= last else 1)
+PY
+}
 port_busy() {
     # Both TCP and UDP are avoided; include non-listening bound UDP sockets.
     local sockets
     sockets=$(ss -H -anlut) || die '无法读取端口占用信息。'
+    # UDP relay ports are opened on demand. An unbound port can still be reserved.
+    if reserved_sk5_port "$1"; then return 0; else
+        [[ $? == 1 ]] || die '无法确认 SK5 预留端口，未修改现有服务。'
+    fi
     printf '%s\n' "$sockets" | awk -v port="$1" '$5 ~ (":" port "$") {found=1} END {exit !found}'
 }
 pick_port() {
