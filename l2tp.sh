@@ -15,7 +15,8 @@ if [[ -f /etc/l2tp-deploy/client.txt ]]; then
     systemctl is-active --quiet l2tp-network.service
     systemctl is-active --quiet ipsec.service
     systemctl is-active --quiet xl2tpd.service
-    echo 'L2TP 已部署。连接资料在 /etc/l2tp-deploy/client.txt。'
+    echo 'L2TP 已部署。现有连接信息如下。'
+    cat /etc/l2tp-deploy/client.txt
     exit 0
 fi
 
@@ -33,10 +34,64 @@ if { command -v ufw >/dev/null && LC_ALL=C ufw status | grep -F 'Status: active'
     exit 1
 fi
 
+if ! { exec 3</dev/tty; } 2>/dev/null; then exec 3<&0; fi
+valid_public_ip() {
+    python3 - "$1" <<'PY_IP'
+import ipaddress
+import sys
+try:
+    ip = ipaddress.IPv4Address(sys.argv[1])
+    valid = ip.is_global and not ip.is_multicast
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)
+PY_IP
+}
 public_ip=${VPN_PUBLIC_IP:-}
-if [[ -z $public_ip ]]; then
-    read -r -p '输入云控制台显示的公网 IPv4: ' public_ip </dev/tty
+if [[ -z $public_ip ]] && command -v curl >/dev/null; then
+    echo '正在检测服务器公网 IPv4……'
+    for url in https://api.ipify.org https://ipv4.icanhazip.com; do
+        detected=$(curl -4 -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null) || continue
+        if valid_public_ip "$detected"; then public_ip=$detected; break; fi
+    done
 fi
+while true; do
+    read -r -p "服务器公网 IPv4${public_ip:+ [$public_ip]}（回车采用，或手动输入）: " answer <&3
+    public_ip=${answer:-$public_ip}
+    valid_public_ip "$public_ip" && break
+    echo '请输入有效的公网 IPv4。'
+done
+username=${VPN_USER:-real}
+while true; do
+    read -r -p "VPN 用户名 [$username]: " answer <&3
+    username=${answer:-$username}
+    [[ $username =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,63}$ ]] && break
+    echo '用户名应为 1–64 位字母、数字或 _ . @ -，并以字母或数字开头。'
+done
+l2tp_port=${VPN_PORT:-$(shuf -i 10000-65535 -n 1)}
+while true; do
+    read -r -p "L2TP UDP 监听端口 [$l2tp_port]: " answer <&3
+    candidate=${answer:-$l2tp_port}
+    if [[ $candidate =~ ^[0-9]{1,5}$ ]] &&
+       (( 10#$candidate >= 1 && 10#$candidate <= 65535 )) &&
+       (( 10#$candidate != 500 && 10#$candidate != 4500 )); then
+        candidate=$((10#$candidate))
+        if [[ -z $(ss -H -lun "sport = :$candidate") ]]; then
+            l2tp_port=$candidate
+            break
+        fi
+        # The default xl2tpd listener can be replaced during a first installation.
+        if [[ $candidate == 1701 ]] &&
+           ! ss -H -lunp 'sport = :1701' | grep -v '("xl2tpd"' | grep -q .; then
+            l2tp_port=$candidate
+            break
+        fi
+        echo '该 UDP 端口已占用，请重新输入。'
+    else
+        echo '端口应为 1–65535，并避开 IPsec 使用的 500 和 4500。'
+    fi
+done
+echo "采用公网 IP $public_ip，用户名 $username，L2TP UDP 端口 $l2tp_port。"
 route=$(ip -4 route get 1.1.1.1)
 egress=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<< "$route")
 [[ $egress =~ ^[[:alnum:]_.:-]+$ ]] || { echo '无法识别出网接口。' >&2; exit 1; }
@@ -120,7 +175,7 @@ conn l2tp-psk
     ikev2=never
     left=%defaultroute
     leftid=$public_ip
-    leftprotoport=17/1701
+    leftprotoport=17/$l2tp_port
     right=%any
     rightprotoport=17/%any
     pfs=no
@@ -131,9 +186,9 @@ conn l2tp-psk
 EOF_IPSEC
 ipsec addconn --config "$stage/ipsec.conf" --checkconfig
 printf '%s %%any : PSK "%s"\n' "$public_ip" "$psk" > "$stage/ipsec.secrets"
-cat > "$stage/xl2tpd.conf" <<'EOF_XL2TPD'
+cat > "$stage/xl2tpd.conf" <<EOF_XL2TPD
 [global]
-port = 1701
+port = $l2tp_port
 
 [lns default]
 ip range = 192.168.18.10-192.168.18.100
@@ -152,15 +207,15 @@ mtu 1400
 mru 1400
 EOF_PPP
 if [[ -f /etc/ppp/chap-secrets ]]; then
-    awk '!($1 == "vpnuser" && ($2 == "l2tpd" || $2 == "*"))' /etc/ppp/chap-secrets > "$stage/chap-secrets"
+    awk -v user="$username" '!($1 == user && ($2 == "l2tpd" || $2 == "*"))' /etc/ppp/chap-secrets > "$stage/chap-secrets"
 fi
-printf 'vpnuser l2tpd "%s" *\n' "$password" >> "$stage/chap-secrets"
-printf '服务器: %s\n用户名: vpnuser\n密码: %s\n预共享密钥: %s\n' "$public_ip" "$password" "$psk" > "$stage/client.txt"
+printf '%s l2tpd "%s" *\n' "$username" "$password" >> "$stage/chap-secrets"
+printf '服务器: %s\nL2TP UDP 端口: %s\nIPsec UDP 端口: 500 / 4500\n用户名: %s\n密码: %s\n预共享密钥: %s\n' "$public_ip" "$l2tp_port" "$username" "$password" "$psk" > "$stage/client.txt"
 
 cat > "$stage/l2tp-network" <<'EOF_NET'
 #!/usr/bin/env bash
 set -euo pipefail
-guard=(-p udp --dport 1701 -m policy --dir in --pol none -m comment --comment l2tp-deploy -j DROP)
+guard=(-p udp --dport "$3" -m policy --dir in --pol none -m comment --comment l2tp-deploy -j DROP)
 nat=(-s 192.168.18.0/24 -o "$2" -m comment --comment l2tp-deploy -j MASQUERADE)
 remove_rules() {
     if iptables -w -C INPUT "${guard[@]}" 2>/dev/null; then iptables -w -D INPUT "${guard[@]}"; fi
@@ -192,8 +247,8 @@ Before=ipsec.service xl2tpd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/libexec/l2tp-network start $egress
-ExecStop=/usr/local/libexec/l2tp-network stop $egress
+ExecStart=/usr/local/libexec/l2tp-network start $egress $l2tp_port
+ExecStop=/usr/local/libexec/l2tp-network stop $egress $l2tp_port
 EOF_UNIT
 cat > "$stage/80-l2tp-network.conf" <<'EOF_DROPIN'
 [Unit]
@@ -219,7 +274,7 @@ systemctl restart ipsec.service xl2tpd.service
 for unit in l2tp-network ipsec xl2tpd; do systemctl is-active --quiet "$unit.service"; done
 state=$(ipsec status)
 grep -F 'l2tp-psk' <<< "$state" >/dev/null
-for port in 500 4500 1701; do
+for port in 500 4500 "$l2tp_port"; do
     for attempt in {1..50}; do
         [[ -n $(ss -H -lun "sport = :$port") ]] && break
         sleep 0.2
@@ -231,5 +286,7 @@ install -m 600 "$stage/client.txt" /etc/l2tp-deploy/client.txt
 changed=0
 
 echo "部署完成。备份位于 $backup。"
-echo '云安全组允许测试客户端的 UDP 500/4500，公网 UDP 1701 保持关闭。'
-echo '仅在自己的终端运行 cat /etc/l2tp-deploy/client.txt 查看连接信息。'
+echo "云安全组允许测试客户端的 UDP 500/4500，公网 L2TP UDP $l2tp_port 保持关闭。"
+cat /etc/l2tp-deploy/client.txt
+echo '客户端选择 L2TP/IPsec PSK，并将 L2TP 目的端口设置为上面打印的端口。'
+echo '请保存连接信息，其中包含密码和预共享密钥。'
