@@ -1,174 +1,235 @@
-#!/bin/bash
-# Ubuntu L2TP/IPsec 一键安装脚本（兼容18.04+）
-# 作者：技术工具库
-# 依赖：xl2tpd + libreswan + ppp
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
 
-# ==================== 自定义配置（请根据需求修改）====================
-VPN_USER="vpnuser"          # VPN登录用户名
-VPN_PASS="YourStrongPass123!"  # VPN登录密码（建议8位以上，含大小写+数字）
-VPN_LOCAL_IP="192.168.18.1"  # VPN服务器内网IP
-VPN_CIDR="192.168.18.0/24"   # VPN客户端分配IP段
-IPSEC_PSK="YourPSKKey123!"   # IPsec预共享密钥（客户端需一致）
-# ===================================================================
+[[ $EUID == 0 ]] || { echo '请以 root 执行。' >&2; exit 1; }
+source /etc/os-release
+[[ $ID == ubuntu && $VERSION_ID == 22.04 ]] || {
+    echo '此修复版已针对 Ubuntu 22.04 的发行版软件包编写。' >&2
+    exit 1
+}
+exec 9>/run/lock/l2tp-deploy.lock
+flock -n 9 || { echo '已有部署正在运行。' >&2; exit 1; }
 
-# 检查是否为root用户
-if [ "$(id -u)" -ne 0 ]; then
-    echo "错误：请使用root用户运行（sudo -i 切换）"
+if [[ -f /etc/l2tp-deploy/client.txt ]]; then
+    systemctl is-active --quiet l2tp-network.service
+    systemctl is-active --quiet ipsec.service
+    systemctl is-active --quiet xl2tpd.service
+    echo 'L2TP 已部署。连接资料在 /etc/l2tp-deploy/client.txt。'
+    exit 0
+fi
+
+if systemctl is-active --quiet ipsec.service ||
+   ip -o link show | grep -E ': ppp[0-9]+:' >/dev/null; then
+    echo '检测到在用 IPsec 或 PPP，停止以免覆盖现有 VPN。' >&2
+    exit 1
+fi
+if { command -v ufw >/dev/null && LC_ALL=C ufw status | grep -F 'Status: active' >/dev/null; } ||
+   systemctl is-active --quiet firewalld.service ||
+   systemctl is-active --quiet nftables.service ||
+   [[ $(iptables -S INPUT | head -n 1) != '-P INPUT ACCEPT' ]] ||
+   [[ $(iptables -S FORWARD | head -n 1) != '-P FORWARD ACCEPT' ]]; then
+    echo '检测到需要单独集成的主机防火墙，未修改配置。' >&2
     exit 1
 fi
 
-# 检查Ubuntu版本
-UBUNTU_VERSION=$(lsb_release -r | awk '{print $2}')
-if [[ ! $UBUNTU_VERSION =~ ^(18.04|20.04|22.04)$ ]]; then
-    echo "错误：仅支持Ubuntu 18.04/20.04/22.04 LTS版本"
-    exit 1
+public_ip=${VPN_PUBLIC_IP:-}
+if [[ -z $public_ip ]]; then
+    read -r -p '输入云控制台显示的公网 IPv4: ' public_ip </dev/tty
+fi
+route=$(ip -4 route get 1.1.1.1)
+egress=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<< "$route")
+[[ $egress =~ ^[[:alnum:]_.:-]+$ ]] || { echo '无法识别出网接口。' >&2; exit 1; }
+python3 - "$public_ip" <<'PY'
+import ipaddress
+import json
+import subprocess
+import sys
+
+public = ipaddress.IPv4Address(sys.argv[1])
+if not public.is_global or public.is_multicast:
+    sys.exit("请输入云控制台中绑定到服务器的公网 IPv4。")
+pool = ipaddress.IPv4Network("192.168.18.0/24")
+for route in json.loads(subprocess.check_output(["ip", "-j", "-4", "route", "show", "table", "main"])):
+    dst = route.get("dst", "default")
+    if dst != "default" and ipaddress.IPv4Network(dst, strict=False).overlaps(pool):
+        sys.exit(f"VPN 地址池和路由 {dst} 重叠，安装已停止。")
+PY
+
+# Use the system's signed APT sources, including its configured domestic mirror.
+if ! dpkg-query -W -f='${db:Status-Status}\n' libreswan xl2tpd ppp openssl 2>/dev/null |
+    awk '$0 == "installed" {n++} END {exit n != 4}'; then
+    apt-get -o Acquire::Retries=2 update
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 install -y libreswan xl2tpd ppp openssl
 fi
 
-echo "===== 开始安装L2TP/IPsec VPN ====="
-echo "系统版本：Ubuntu $UBUNTU_VERSION"
-echo "VPN配置：用户=$VPN_USER，IP段=$VPN_CIDR，PSK=$IPSEC_PSK"
+backup=$(mktemp -d /root/l2tp-backup.XXXXXX)
+stage=$(mktemp -d)
+files=(
+    /etc/ipsec.conf /etc/ipsec.secrets
+    /etc/xl2tpd/xl2tpd.conf /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets
+    /usr/local/libexec/l2tp-network
+    /etc/systemd/system/l2tp-network.service
+    /etc/systemd/system/ipsec.service.d/80-l2tp-network.conf
+    /etc/systemd/system/xl2tpd.service.d/80-l2tp-network.conf
+    /etc/l2tp-deploy/client.txt
+)
+forward_before=$(sysctl -n net.ipv4.ip_forward)
+systemctl is-active --quiet xl2tpd.service && xl2tpd_was_active=1 || xl2tpd_was_active=0
+systemctl is-enabled --quiet ipsec.service && ipsec_was_enabled=1 || ipsec_was_enabled=0
+systemctl is-enabled --quiet xl2tpd.service && xl2tpd_was_enabled=1 || xl2tpd_was_enabled=0
+changed=0
+cleanup() {
+    local status=$?
+    if (( status && changed )); then
+        echo "部署失败，正在恢复配置。备份位于 $backup" >&2
+        systemctl stop ipsec.service xl2tpd.service l2tp-network.service || true
+        local file
+        for file in "${files[@]}"; do
+            if [[ -e "$backup$file" || -L "$backup$file" ]]; then
+                cp -a --remove-destination "$backup$file" "$file" || echo "恢复失败：$file" >&2
+            else
+                rm -f -- "$file"
+            fi
+        done
+        sysctl -w "net.ipv4.ip_forward=$forward_before" >/dev/null || true
+        systemctl daemon-reload || true
+        (( ipsec_was_enabled )) || systemctl disable ipsec.service || true
+        (( xl2tpd_was_enabled )) || systemctl disable xl2tpd.service || true
+        if (( xl2tpd_was_active )); then systemctl start xl2tpd.service || true; fi
+    fi
+    rm -rf -- "$stage"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for file in "${files[@]}"; do
+    if [[ -e $file || -L $file ]]; then cp -a --parents "$file" "$backup/"; fi
+done
+iptables-save > "$backup/iptables.rules"
 
-# 1. 更新系统并安装依赖
-echo -e "\n1. 安装依赖包..."
-apt update -y && apt install -y xl2tpd xmlto libnss3-dev libnss3-tools \
-libnspr4-dev libpam0g-dev libcap-ng-dev libcap-ng-utils libunbound-dev \
-libevent-dev libcurl4-nss-dev libsystemd-dev ppp flex bison gcc make python3
-
-# 2. 编译安装最新版libreswan（使用清华大学镜像源，替换原官方源）
-echo -e "\n2. 安装libreswan（IPsec核心）..."
-# 清华大学镜像源地址：https://mirrors.tuna.tsinghua.edu.cn/libreswan/
-wget -q https://mirrors.tuna.tsinghua.edu.cn/libreswan/libreswan-4.12.tar.gz -O /tmp/libreswan.tar.gz
-tar -zxf /tmp/libreswan.tar.gz -C /tmp
-cd /tmp/libreswan-* || exit 1
-./configure --prefix=/usr/local --sysconfdir=/etc --with-systemd
-make -j$(nproc) && make install
-cd - && rm -rf /tmp/libreswan*
-
-# 3. 配置IPsec
-echo -e "\n3. 配置IPsec..."
-cat > /etc/ipsec.conf << EOF
-version 2.0
+psk=$(openssl rand -hex 24)
+password=$(openssl rand -hex 16)
+cat > "$stage/ipsec.conf" <<EOF_IPSEC
 config setup
-    protostack=netkey
-    interfaces=%defaultroute
-    uniqueids=no
-    virtual_private=%v4:10.0.0.0/8,%v4:192.168.0.0/16,%v4:172.16.0.0/12
-    nat_traversal=yes
-    keep_alive=60
-    dpddelay=30
-    dpdtimeout=120
 
-conn L2TP-PSK-NAT
-    rightsubnet=0.0.0.0/0
+conn l2tp-psk
+    auto=add
+    type=transport
+    authby=secret
+    ikev2=never
     left=%defaultroute
+    leftid=$public_ip
     leftprotoport=17/1701
     right=%any
     rightprotoport=17/%any
-    authby=secret
     pfs=no
-    auto=add
-    type=transport
-    forceencaps=yes
-    ike=aes256-sha1;modp1024
-    phase2alg=aes256-sha1;modp1024
+    rekey=no
     dpddelay=30
     dpdtimeout=120
     dpdaction=clear
-EOF
-
-# 配置IPsec预共享密钥
-cat > /etc/ipsec.secrets << EOF
-: PSK "$IPSEC_PSK"
-EOF
-chmod 600 /etc/ipsec.secrets
-
-# 4. 配置xl2tpd
-echo -e "\n4. 配置xl2tpd..."
-cat > /etc/xl2tpd/xl2tpd.conf << EOF
+EOF_IPSEC
+ipsec addconn --config "$stage/ipsec.conf" --checkconfig
+printf '%s %%any : PSK "%s"\n' "$public_ip" "$psk" > "$stage/ipsec.secrets"
+cat > "$stage/xl2tpd.conf" <<'EOF_XL2TPD'
 [global]
-ipsec saref = yes
-listen-addr = 0.0.0.0
+port = 1701
 
 [lns default]
-ip range = $VPN_CIDR
-local ip = $VPN_LOCAL_IP
-require chap = yes
-refuse pap = yes
+ip range = 192.168.18.10-192.168.18.100
+local ip = 192.168.18.1
 require authentication = yes
-name = L2TP-VPN-Server
-ppp debug = no
+refuse pap = yes
 pppoptfile = /etc/ppp/options.xl2tpd
-length bit = yes
-EOF
-
-# 配置PPP选项
-cat > /etc/ppp/options.xl2tpd << EOF
-ipcp-accept-local
-ipcp-accept-remote
-ms-dns 8.8.8.8
-ms-dns 1.1.1.1
-noccp
+EOF_XL2TPD
+cat > "$stage/options.xl2tpd" <<'EOF_PPP'
+name l2tpd
 auth
-crtscts
-idle 1800
-mtu 1410
-mru 1410
-nodefaultroute
-debug
-lock
-proxyarp
-connect-delay 5000
-EOF
-
-# 添加VPN用户（chap-secrets）
-cat > /etc/ppp/chap-secrets << EOF
-$VPN_USER * $VPN_PASS *
-EOF
-chmod 600 /etc/ppp/chap-secrets
-
-# 5. 配置系统转发和防火墙
-echo -e "\n5. 配置网络转发和防火墙..."
-# 开启IP转发
-cat >> /etc/sysctl.conf << EOF
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-EOF
-sysctl -p
-
-# 开放VPN端口（UDP 500/4500/1701）
-ufw allow 500/udp
-ufw allow 4500/udp
-ufw allow 1701/udp
-ufw reload
-
-# 配置iptables转发规则
-SERVER_IP=$(curl -s icanhazip.com)  # 自动获取服务器公网IP
-iptables -t nat -A POSTROUTING -s $VPN_CIDR -o eth0 -j SNAT --to-source $SERVER_IP
-iptables -A FORWARD -s $VPN_CIDR -j ACCEPT
-iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-# 保存iptables规则（重启生效）
-if [ -f /etc/iptables/rules.v4 ]; then
-    iptables-save > /etc/iptables/rules.v4
-else
-    mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4
+require-mschap-v2
+ms-dns 223.5.5.5
+ms-dns 1.1.1.1
+mtu 1400
+mru 1400
+EOF_PPP
+if [[ -f /etc/ppp/chap-secrets ]]; then
+    awk '!($1 == "vpnuser" && ($2 == "l2tpd" || $2 == "*"))' /etc/ppp/chap-secrets > "$stage/chap-secrets"
 fi
+printf 'vpnuser l2tpd "%s" *\n' "$password" >> "$stage/chap-secrets"
+printf '服务器: %s\n用户名: vpnuser\n密码: %s\n预共享密钥: %s\n' "$public_ip" "$password" "$psk" > "$stage/client.txt"
 
-# 6. 设置服务自启动并启动
-echo -e "\n6. 启动服务并设置自启..."
+cat > "$stage/l2tp-network" <<'EOF_NET'
+#!/usr/bin/env bash
+set -euo pipefail
+guard=(-p udp --dport 1701 -m policy --dir in --pol none -m comment --comment l2tp-deploy -j DROP)
+nat=(-s 192.168.18.0/24 -o "$2" -m comment --comment l2tp-deploy -j MASQUERADE)
+remove_rules() {
+    if iptables -w -C INPUT "${guard[@]}" 2>/dev/null; then iptables -w -D INPUT "${guard[@]}"; fi
+    if iptables -w -t nat -C POSTROUTING "${nat[@]}" 2>/dev/null; then
+        iptables -w -t nat -D POSTROUTING "${nat[@]}"
+    fi
+}
+case $1 in
+    start)
+        trap 'remove_rules' ERR
+        iptables -w -C INPUT "${guard[@]}" 2>/dev/null || iptables -w -I INPUT 1 "${guard[@]}"
+        iptables -w -t nat -C POSTROUTING "${nat[@]}" 2>/dev/null ||
+            iptables -w -t nat -A POSTROUTING "${nat[@]}"
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        ;;
+    stop)
+        remove_rules
+        ;;
+    *) exit 2 ;;
+esac
+EOF_NET
+cat > "$stage/l2tp-network.service" <<EOF_UNIT
+[Unit]
+Description=L2TP IPsec firewall and IPv4 forwarding
+Wants=network-online.target
+After=network-online.target
+Before=ipsec.service xl2tpd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/l2tp-network start $egress
+ExecStop=/usr/local/libexec/l2tp-network stop $egress
+EOF_UNIT
+cat > "$stage/80-l2tp-network.conf" <<'EOF_DROPIN'
+[Unit]
+Requires=l2tp-network.service
+After=l2tp-network.service
+EOF_DROPIN
+
+changed=1
+install -d -m 700 /etc/l2tp-deploy
+install -d -m 755 /usr/local/libexec /etc/systemd/system/ipsec.service.d /etc/systemd/system/xl2tpd.service.d
+for file in "${files[@]}"; do
+    [[ $file == /etc/l2tp-deploy/client.txt ]] && continue
+    mode=644
+    case $file in
+        */ipsec.secrets|*/chap-secrets) mode=600 ;;
+        /usr/local/libexec/l2tp-network) mode=755 ;;
+    esac
+    install -m "$mode" "$stage/${file##*/}" "$file"
+done
 systemctl daemon-reload
-systemctl enable ipsec xl2tpd
-systemctl restart ipsec xl2tpd
+systemctl restart l2tp-network.service
+systemctl restart ipsec.service xl2tpd.service
+for unit in l2tp-network ipsec xl2tpd; do systemctl is-active --quiet "$unit.service"; done
+state=$(ipsec status)
+grep -F 'l2tp-psk' <<< "$state" >/dev/null
+for port in 500 4500 1701; do
+    for attempt in {1..50}; do
+        [[ -n $(ss -H -lun "sport = :$port") ]] && break
+        sleep 0.2
+    done
+    [[ -n $(ss -H -lun "sport = :$port") ]] || { echo "UDP $port 未监听。" >&2; exit 1; }
+done
+systemctl enable ipsec.service xl2tpd.service
+install -m 600 "$stage/client.txt" /etc/l2tp-deploy/client.txt
+changed=0
 
-# 7. 验证安装结果
-echo -e "\n===== 安装完成！====="
-echo "VPN连接信息："
-echo "服务器地址：$SERVER_IP"
-echo "IPsec预共享密钥（PSK）：$IPSEC_PSK"
-echo "VPN用户名：$VPN_USER"
-echo "VPN密码：$VPN_PASS"
-echo "客户端配置：选择L2TP/IPsec模式，填入上述信息即可"
-echo -e "\n测试命令（服务器端）："
-echo "systemctl status ipsec xl2tpd  # 查看服务状态"
-echo "journalctl -xe | grep xl2tpd  # 查看连接日志"
+echo "部署完成。备份位于 $backup。"
+echo '云安全组允许测试客户端的 UDP 500/4500，公网 UDP 1701 保持关闭。'
+echo '仅在自己的终端运行 cat /etc/l2tp-deploy/client.txt 查看连接信息。'
