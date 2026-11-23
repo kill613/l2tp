@@ -258,7 +258,7 @@ preflight() {
             die '检测到 strongSwan，安装 Libreswan 会替换其他 IPsec 组件，请先处理现有部署。'
         fi
     done
-    if [[ -x /usr/local/sbin/ipsec || -x /usr/local/libexec/ipsec/pluto ]]; then
+    if { [[ -x /usr/local/sbin/ipsec ]] && [[ $(readlink -f /usr/local/sbin/ipsec) != "$LIBRESWAN_PREFIX/sbin/ipsec" ]]; } || [[ -x /usr/local/libexec/ipsec/pluto ]]; then
         die '检测到旧版源码安装的 IPsec。请先备份并卸载该源码版本，避免与系统软件包同时运行。'
     fi
     detect_backend
@@ -519,7 +519,7 @@ backup_files() {
     for path in /etc/l2tp-deploy/client.txt /usr/local/libexec/l2tp-network /etc/systemd/system/l2tp-network.service \
         /etc/systemd/system/ipsec.service.d/80-l2tp-network.conf /etc/systemd/system/xl2tpd.service.d/80-l2tp-network.conf "$CONFIG_FILE" "$RUNTIME" /etc/ipsec.conf /etc/ipsec.secrets /etc/xl2tpd/xl2tpd.conf \
         /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets /etc/ufw/before.rules \
-        /etc/systemd/system/ipsec.service /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
+        /usr/local/sbin/ipsec /etc/systemd/system/ipsec.service /etc/sysctl.d/99-l2tp-installer.conf /etc/systemd/system/l2tp-firewall.service \
         /etc/systemd/system/ipsec.service.d/l2tp-installer.conf /etc/systemd/system/xl2tpd.service.d/l2tp-installer.conf; do
         printf '%s\n' "$path" >> "$BACKUP_DIR/manifest"
         if [[ -e $path ]]; then
@@ -608,6 +608,7 @@ EOF
     cp -a "$target/." "$LIBRESWAN_PREFIX/"
     IPSEC_BIN=$LIBRESWAN_PREFIX/sbin/ipsec
     ipsec --version | grep -F '4.15' >/dev/null || die 'Libreswan 版本检查失败。'
+    install -m 644 "$source/COPYING" "$LIBRESWAN_PREFIX/COPYING"
     touch "$LIBRESWAN_PREFIX/ikuai-zero-lifetime-v1"
 }
 
@@ -855,6 +856,8 @@ Restart=on-failure
 RestartSec=5s
 EOF
     done
+    install -d -m 755 /usr/local/sbin
+    ln -sfn "$IPSEC_BIN" /usr/local/sbin/ipsec
     systemctl daemon-reload
     systemctl enable l2tp-firewall ipsec xl2tpd
     systemctl restart l2tp-firewall
